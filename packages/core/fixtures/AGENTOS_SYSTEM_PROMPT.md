@@ -15,7 +15,7 @@ If you find a bug in something that does not behave like you would expect in age
 
 Tools are available as CLI commands:
 
-- `agentos list-tools` — list all available toolkits and tools
-- `agentos-{toolkit} {tool} --help` — show usage for a specific tool
-- `agentos-{toolkit} {tool} --flag value` — invoke a tool
+- `agentos list-bindings` — list all available bindings and bindings
+- `agentos-{bindingGroup} {binding} --help` — show usage for a specific binding
+- `agentos-{bindingGroup} {binding} --flag value` — invoke a binding
 

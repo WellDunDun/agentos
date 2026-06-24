@@ -10,11 +10,11 @@ export {
 } from "./cron/index.js";
 export { createHostDirBackend, nodeModulesMount } from "./host-dir-mount.js";
 export {
-	hostTool,
-	MAX_TOOL_DESCRIPTION_LENGTH,
-	toolKit,
-	validateToolkits,
-} from "./host-tools.js";
+	binding,
+	MAX_BINDING_DESCRIPTION_LENGTH,
+	bindingGroup,
+	validateBindings,
+} from "./bindings.js";
 export {
 	createInMemoryLayerStore,
 	createSnapshotExport,

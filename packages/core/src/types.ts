@@ -61,7 +61,7 @@ export type {
 	HostDirMountPluginConfig,
 	NodeModulesMountConfig,
 } from "./host-dir-mount.js";
-export type { HostTool, ToolExample, ToolKit } from "./host-tools.js";
+export type { Binding, BindingExample, BindingGroup } from "./bindings.js";
 export type {
 	AcpTimeoutErrorData,
 	JsonRpcError,

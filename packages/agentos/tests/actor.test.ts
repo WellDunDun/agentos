@@ -359,7 +359,7 @@ describe("@rivet-dev/agentos native plugin package bridge", () => {
 						packageDir: "/abs/project/node_modules/@agentos-software/pi",
 						agent: {},
 					},
-					{ packageDir: "/abs/tool-package", hostTool: {} },
+					{ packageDir: "/abs/tool-package", binding: {} },
 				],
 			},
 			preview: {

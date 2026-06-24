@@ -48,8 +48,8 @@ interface SoftwareDescriptorLike {
 	packageDir?: string;
 	requires?: string[];
 	agent?: unknown;
-	hostTool?: unknown;
-	toolkit?: unknown;
+	binding?: unknown;
+	bindingGroup?: unknown;
 }
 
 interface NativeMountLike {
@@ -218,12 +218,12 @@ export function buildConfigJson<TConnParams>(
 			// Wasm command directory (kind defaults to WasmCommands on the Rust side).
 			software.push({ package: d.commandDir });
 		} else if (typeof d.packageDir === "string") {
-			// Agent SDK / host-tool package: forwarded but not mounted as commands.
+			// Agent SDK / host-binding package: forwarded but not mounted as commands.
 			// `kind` matches the kebab-case serde tags of the Rust `SoftwareKind`
 			// enum (`wasm-commands` / `agent` / `tool`).
 			software.push({
 				package: d.packageDir,
-				kind: d.hostTool || d.toolkit ? "tool" : "agent",
+				kind: d.binding || d.bindingGroup ? "tool" : "agent",
 			});
 		}
 	}

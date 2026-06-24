@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { z } from "zod";
-import { AgentOs, hostTool, toolKit } from "../src/index.js";
+import { AgentOs, binding, bindingGroup } from "../src/index.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
 
@@ -46,11 +46,11 @@ process.stdin.on('data', (chunk) => {
 });
 `;
 
-const mathToolKit = toolKit({
+const mathBindingGroup = bindingGroup({
 	name: "math",
 	description: "Math utilities",
-	tools: {
-		add: hostTool({
+	bindings: {
+		add: binding({
 			description: "Add two numbers",
 			inputSchema: z.object({
 				a: z.number(),
@@ -67,13 +67,13 @@ const mathToolKit = toolKit({
 	},
 });
 
-describe("tool reference registration", () => {
+describe("binding reference registration", () => {
 	let vm: AgentOs;
 
 	beforeEach(async () => {
 		vm = await AgentOs.create({
 			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
-			toolKits: [mathToolKit],
+			bindings: [mathBindingGroup],
 		});
 	});
 
@@ -95,24 +95,24 @@ describe("tool reference registration", () => {
 		};
 	}
 
-	test("stores generated tool reference markdown on the VM", () => {
-		const toolReference = (vm as unknown as { _toolReference: string })
-			._toolReference;
+	test("stores generated binding reference markdown on the VM", () => {
+		const bindingReference = (vm as unknown as { _bindingReference: string })
+			._bindingReference;
 
-		expect(toolReference).toContain("## Available Host Tools");
-		expect(toolReference).toContain(
-			"Run `agentos list-tools` to see all available tools.",
+		expect(bindingReference).toContain("## Available Host Bindings");
+		expect(bindingReference).toContain(
+			"Run `agentos list-bindings` to see all available bindings.",
 		);
-		expect(toolReference).toContain("### math");
-		expect(toolReference).toContain("Math utilities");
-		expect(toolReference).toContain(
+		expect(bindingReference).toContain("### math");
+		expect(bindingReference).toContain("Math utilities");
+		expect(bindingReference).toContain(
 			"`agentos-math add --a <number> --b <number>`",
 		);
-		expect(toolReference).toContain("Add 1 and 2");
+		expect(bindingReference).toContain("Add 1 and 2");
 	});
 
-	test("createSession injects the registered tool reference into the system prompt", async () => {
-		const scriptPath = "/tmp/mock-tool-reference-adapter.mjs";
+	test("createSession injects the registered binding reference into the system prompt", async () => {
+		const scriptPath = "/tmp/mock-binding-reference-adapter.mjs";
 		await vm.writeFile(scriptPath, MOCK_ACP_ADAPTER);
 		const restore = useMockAdapterBin(scriptPath);
 
@@ -126,7 +126,7 @@ describe("tool reference registration", () => {
 			const argIndex = argv.indexOf("--append-system-prompt");
 			expect(argIndex).toBeGreaterThan(-1);
 			const prompt = argv[argIndex + 1];
-			expect(prompt).toContain("## Available Host Tools");
+			expect(prompt).toContain("## Available Host Bindings");
 			expect(prompt).toContain("`agentos-math add --a <number> --b <number>`");
 			expect(prompt).toContain("### math");
 
