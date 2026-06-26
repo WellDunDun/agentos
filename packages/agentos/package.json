@@ -54,8 +54,8 @@
 		"@agentos-software/common": "catalog:",
 		"@rivet-dev/agentos-core": "workspace:*",
 		"@rivet-dev/agentos-sidecar": "workspace:*",
-		"@rivetkit/react": "0.0.0-feat-dylib-actor-plugin.c44621f",
-		"rivetkit": "0.0.0-feat-dylib-actor-plugin.c44621f",
+		"@rivetkit/react": "0.0.0-feat-dylib-actor-plugin.8633327",
+		"rivetkit": "0.0.0-feat-dylib-actor-plugin.8633327",
 		"zod": "^4.1.11"
 	},
 	"peerDependencies": {

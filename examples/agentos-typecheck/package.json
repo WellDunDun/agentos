@@ -9,7 +9,7 @@
 	},
 	"dependencies": {
 		"@rivet-dev/agentos": "workspace:*",
-		"rivetkit": "0.0.0-feat-dylib-actor-plugin.c44621f"
+		"rivetkit": "0.0.0-feat-dylib-actor-plugin.8633327"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.2",
