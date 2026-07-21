@@ -1082,6 +1082,10 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.resources.limits()
     }
 
+    pub fn resource_limit_snapshots(&self) -> Vec<agentos_bridge::queue_tracker::QueueSnapshot> {
+        self.resources.limit_snapshots()
+    }
+
     pub fn set_permissions(&mut self, permissions: Permissions) {
         self.filesystem.set_permissions(permissions.clone());
         self.permissions = permissions;

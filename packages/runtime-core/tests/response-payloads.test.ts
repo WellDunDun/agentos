@@ -233,6 +233,20 @@ describe("response payload conversion", () => {
 							fillPercent: 2n,
 						},
 					],
+					limitSnapshots: [
+						{
+							name: "resources_max_processes",
+							configPath: "limits.resources.maxProcesses",
+							description: "Processes retained in the VM process table.",
+							category: "resource",
+							unit: "count",
+							source: "configured",
+							used: 2n,
+							highWater: 4n,
+							capacity: 64n,
+							fillPercent: 3n,
+						},
+					],
 				},
 			}),
 		).toEqual({
@@ -259,6 +273,20 @@ describe("response payload conversion", () => {
 					high_water: 3,
 					capacity: 128,
 					fill_percent: 2,
+				},
+			],
+			limit_snapshots: [
+				{
+					name: "resources_max_processes",
+					config_path: "limits.resources.maxProcesses",
+					description: "Processes retained in the VM process table.",
+					category: "resource",
+					unit: "count",
+					source: "configured",
+					used: 2,
+					high_water: 4,
+					capacity: 64,
+					fill_percent: 3,
 				},
 			],
 		});

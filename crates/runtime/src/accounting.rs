@@ -154,12 +154,14 @@ impl std::error::Error for LimitError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceUsage {
     pub used: usize,
+    pub high_water: usize,
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Default)]
 struct CounterState {
     used: usize,
+    high_water: usize,
     warning_active: bool,
 }
 
@@ -257,6 +259,7 @@ impl ResourceLedger {
                 amount,
             });
         }
+        observe_committed_allocations(&allocations);
         Ok(Reservation {
             resource,
             amount,
@@ -314,8 +317,6 @@ impl ResourceLedger {
             }
         }
         counter.used = requested_total.unwrap_or(usize::MAX);
-        maybe_warn(&self.inner, resource, counter);
-        observe_usage(&self.inner, resource, counter.used);
         Ok(())
     }
 
@@ -333,6 +334,10 @@ impl ResourceLedger {
                 .counters
                 .get(&resource)
                 .map_or(0, |counter| counter.used),
+            high_water: state
+                .counters
+                .get(&resource)
+                .map_or(0, |counter| counter.high_water),
             limit: self.inner.limits.get(&resource).map(|limit| limit.maximum),
         }
     }
@@ -463,6 +468,23 @@ struct Allocation {
     ledger: Arc<LedgerInner>,
     resource: ResourceClass,
     amount: usize,
+}
+
+fn observe_committed_allocations(allocations: &[Allocation]) {
+    for allocation in allocations {
+        let mut state = allocation.ledger.state.lock().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "ERR_AGENTOS_RESOURCE_LEDGER_POISONED: recovering observe scope={} resource={}",
+                allocation.ledger.scope,
+                allocation.resource.name()
+            );
+            poisoned.into_inner()
+        });
+        let counter = state.counters.entry(allocation.resource).or_default();
+        counter.high_water = counter.high_water.max(counter.used);
+        maybe_warn(&allocation.ledger, allocation.resource, counter);
+        observe_usage(&allocation.ledger, allocation.resource, counter.used);
+    }
 }
 
 fn release_allocation(allocation: &Allocation) {
@@ -703,6 +725,8 @@ mod tests {
         drop(reservation);
         assert!(process.is_zero());
         assert!(vm.is_zero());
+        assert_eq!(process.usage(ResourceClass::BufferedBytes).high_water, 6);
+        assert_eq!(vm.usage(ResourceClass::BufferedBytes).high_water, 6);
     }
 
     #[test]

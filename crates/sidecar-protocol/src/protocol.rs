@@ -1555,6 +1555,8 @@ pub type ProcessSnapshotResponse = crate::wire::ProcessSnapshotResponse;
 
 pub type QueueSnapshotEntry = crate::wire::QueueSnapshotEntry;
 
+pub type LimitSnapshotEntry = crate::wire::LimitSnapshotEntry;
+
 pub type ResourceSnapshotResponse = crate::wire::ResourceSnapshotResponse;
 
 pub type SocketStateEntry = crate::wire::SocketStateEntry;

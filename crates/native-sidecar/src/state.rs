@@ -225,6 +225,10 @@ impl VmPendingByteBudget {
     pub(crate) fn limit(&self) -> usize {
         self.limit
     }
+
+    pub(crate) fn snapshot(&self) -> agentos_bridge::queue_tracker::QueueSnapshot {
+        self.gauge.snapshot()
+    }
 }
 
 #[derive(Debug)]
@@ -835,6 +839,9 @@ pub(crate) struct VmState {
     /// Operator-tunable VM-scoped runtime limits. Immutable for the VM's lifetime;
     /// `ConfigureVm` does not mutate limits.
     pub(crate) limits: crate::limits::VmLimits,
+    /// Explicit limit leaves supplied by the operator. Kept separately from
+    /// `limits` so system-info can distinguish overrides from defaults.
+    pub(crate) configured_limits: vm_config::VmLimitsConfig,
     pub(crate) pending_stdin_bytes_budget: Arc<VmPendingByteBudget>,
     pub(crate) pending_event_bytes_budget: Arc<VmPendingByteBudget>,
     /// Child of the one process ledger owned by RuntimeContext.

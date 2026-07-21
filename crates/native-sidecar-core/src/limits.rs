@@ -10,6 +10,8 @@ use agentos_vm_config::{
     Http2LimitsConfig, ReactorLimitsConfig, ResourceLimitsConfig, TlsLimitsConfig, UdpLimitsConfig,
     VmLimitsConfig,
 };
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::SidecarCoreError;
 
@@ -116,7 +118,8 @@ pub const DEFAULT_HTTP2_MAX_PENDING_EVENT_BYTES: usize = 4 * 1024 * 1024;
 /// All operator-tunable VM-scoped limits. Fields are concrete values; the `Default` impls own the
 /// numbers and equal today's hardcoded constants, so unset operator config leaves behavior
 /// unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VmLimits {
     pub reactor: ReactorLimits,
     /// Kernel resource limits (existing type, existing `resource.*` keys).
@@ -135,7 +138,8 @@ pub struct VmLimits {
     pub process: ProcessLimits,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReactorLimits {
     pub max_capabilities: usize,
     pub max_ready_handles: usize,
@@ -204,24 +208,28 @@ pub fn virtual_os_freemem_bytes(resource_limits: &ResourceLimits) -> u64 {
         .unwrap_or(512 * 1024 * 1024)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HttpLimits {
     /// Cap on `vm.fetch()` buffered response bodies. Must be `<=` the sidecar wire frame cap.
     pub max_fetch_response_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UdpLimits {
     pub max_buffered_datagrams: usize,
     pub max_buffered_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TlsLimits {
     pub max_buffered_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Http2Limits {
     pub max_connections: usize,
     pub max_streams: usize,
@@ -235,7 +243,8 @@ pub struct Http2Limits {
     pub max_pending_event_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BindingLimits {
     pub default_binding_timeout_ms: u64,
     pub max_binding_timeout_ms: u64,
@@ -247,13 +256,15 @@ pub struct BindingLimits {
     pub max_binding_example_input_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginLimits {
     pub max_persisted_manifest_bytes: usize,
     pub max_persisted_manifest_file_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpLimits {
     /// Maximum length of a single ACP adapter stdout line. Threaded into `AcpClientOptions`.
     pub max_read_line_bytes: usize,
@@ -293,13 +304,15 @@ pub struct AcpLimits {
     pub max_permission_outcomes_per_vm: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SqliteLimits {
     /// Maximum materialized bytes returned by one SQLite statement.
     pub max_result_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JsRuntimeLimits {
     /// `None` keeps the V8 engine default heap. Carried as the typed
     /// `JavascriptExecutionLimits.v8_heap_limit_mb` on the execution request
@@ -324,7 +337,8 @@ pub struct JsRuntimeLimits {
     pub v8_ipc_max_frame_bytes: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PythonLimits {
     pub output_buffer_max_bytes: usize,
     pub execution_timeout_ms: u64,
@@ -333,7 +347,8 @@ pub struct PythonLimits {
     pub vfs_rpc_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WasmLimits {
     pub max_module_file_bytes: u64,
     pub captured_output_limit_bytes: usize,
@@ -347,7 +362,8 @@ pub struct WasmLimits {
     pub runner_cpu_time_limit_ms: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcessLimits {
     /// Maximum file actions decoded for one posix_spawn request.
     pub max_spawn_file_actions: usize,
@@ -512,6 +528,183 @@ impl Default for ProcessLimits {
             pending_event_count: DEFAULT_PROCESS_PENDING_EVENT_COUNT,
             pending_event_bytes: DEFAULT_PROCESS_PENDING_EVENT_BYTES,
         }
+    }
+}
+
+/// One effective operator-facing limit. This catalog is generated from the same
+/// typed `VmLimits` value that enforcement uses, so inspector clients never need
+/// to duplicate defaults or enumerate config fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveLimit {
+    pub name: String,
+    pub config_path: String,
+    pub description: String,
+    pub unit: String,
+    pub capacity: Option<u64>,
+    pub configured: bool,
+}
+
+/// Return every effective VM limit, including fields that do not yet have a
+/// continuous usage gauge. `configured` reflects whether the caller explicitly
+/// supplied that leaf in `CreateVmConfig.limits`.
+pub fn effective_vm_limits(
+    limits: &VmLimits,
+    configured: Option<&VmLimitsConfig>,
+) -> Result<Vec<EffectiveLimit>, SidecarCoreError> {
+    let effective = serde_json::to_value(limits).map_err(|error| {
+        SidecarCoreError::new(format!("failed to serialize effective VM limits: {error}"))
+    })?;
+    let configured =
+        serde_json::to_value(configured.cloned().unwrap_or_default()).map_err(|error| {
+            SidecarCoreError::new(format!("failed to serialize configured VM limits: {error}"))
+        })?;
+
+    let mut capacities = BTreeMap::new();
+    flatten_limit_values("limits", &effective, &mut capacities);
+    let mut configured_paths = BTreeSet::new();
+    collect_configured_limit_paths("limits", &configured, &mut configured_paths);
+
+    Ok(capacities
+        .into_iter()
+        .map(|(config_path, capacity)| EffectiveLimit {
+            name: limit_name(&config_path),
+            description: limit_description(&config_path),
+            unit: limit_unit(&config_path).to_owned(),
+            configured: configured_paths.contains(&config_path),
+            config_path,
+            capacity,
+        })
+        .collect())
+}
+
+fn flatten_limit_values(prefix: &str, value: &Value, output: &mut BTreeMap<String, Option<u64>>) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                flatten_limit_values(&format!("{prefix}.{key}"), value, output);
+            }
+        }
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                output.insert(prefix.to_owned(), Some(value));
+            }
+        }
+        Value::Null => {
+            output.insert(prefix.to_owned(), None);
+        }
+        _ => {}
+    }
+}
+
+fn collect_configured_limit_paths(prefix: &str, value: &Value, output: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                collect_configured_limit_paths(&format!("{prefix}.{key}"), value, output);
+            }
+        }
+        Value::Number(_) | Value::Null => {
+            output.insert(prefix.to_owned());
+        }
+        _ => {}
+    }
+}
+
+fn limit_name(config_path: &str) -> String {
+    config_path
+        .strip_prefix("limits.")
+        .unwrap_or(config_path)
+        .split('.')
+        .map(camel_to_snake)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn camel_to_snake(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for (index, ch) in value.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index != 0 {
+                output.push('_');
+            }
+            output.push(ch.to_ascii_lowercase());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn limit_description(config_path: &str) -> String {
+    match config_path {
+        "limits.resources.maxProcesses" => {
+            String::from("Processes retained in the VM process table.")
+        }
+        "limits.resources.maxOpenFds" => String::from("Open file descriptors across VM processes."),
+        "limits.resources.maxSockets" => String::from("Open sockets in the VM socket table."),
+        "limits.resources.maxConnections" => String::from("Established VM socket connections."),
+        "limits.resources.maxSocketBufferedBytes" => {
+            String::from("Bytes retained in VM socket buffers.")
+        }
+        "limits.resources.maxFilesystemBytes" => {
+            String::from("Bytes stored in the writable virtual filesystem.")
+        }
+        "limits.resources.maxInodeCount" => {
+            String::from("Inodes retained by the virtual filesystem.")
+        }
+        "limits.process.pendingStdinBytes" => {
+            String::from("Stdin bytes accepted but not yet written into kernel pipes.")
+        }
+        "limits.process.pendingEventCount" => {
+            String::from("Events waiting in VM process-delivery queues.")
+        }
+        "limits.process.pendingEventBytes" => {
+            String::from("Bytes retained in VM process-event queues.")
+        }
+        "limits.jsRuntime.v8HeapLimitMb" => String::from("Guest JavaScript heap retained by V8."),
+        "limits.jsRuntime.cpuTimeLimitMs" => String::from("Active guest JavaScript CPU time."),
+        "limits.jsRuntime.wallClockLimitMs" => {
+            String::from("Elapsed guest JavaScript wall-clock time.")
+        }
+        "limits.jsRuntime.maxTimers" => String::from("Live timers owned by one VM execution."),
+        "limits.resources.maxWasmMemoryBytes" => String::from("Guest WASM linear memory."),
+        _ => {
+            let key = config_path.rsplit('.').next().unwrap_or(config_path);
+            let words = camel_to_words(key);
+            format!("Effective {words} limit.")
+        }
+    }
+}
+
+fn camel_to_words(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 8);
+    for (index, ch) in value.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index != 0 {
+                output.push(' ');
+            }
+            output.push(ch.to_ascii_lowercase());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn limit_unit(config_path: &str) -> &'static str {
+    let key = config_path.rsplit('.').next().unwrap_or(config_path);
+    if key.ends_with("Bytes") || key.ends_with("ByteLimit") {
+        "bytes"
+    } else if key.ends_with("Ms") || key.ends_with("Timeout") {
+        "ms"
+    } else if key.ends_with("Mb") {
+        "MiB"
+    } else if key.ends_with("Fuel") {
+        "fuel"
+    } else if key == "cpuCount" {
+        "CPUs"
+    } else {
+        "count"
     }
 }
 
@@ -1738,10 +1931,45 @@ mod tests {
     use super::*;
     use agentos_vm_config::{
         AcpLimitsConfig, Http2LimitsConfig, ProcessLimitsConfig, ReactorLimitsConfig,
-        TlsLimitsConfig, UdpLimitsConfig,
+        ResourceLimitsConfig, TlsLimitsConfig, UdpLimitsConfig,
     };
 
     const FRAME_CAP: usize = 16 * 1024 * 1024;
+
+    #[test]
+    fn effective_limit_catalog_covers_defaults_and_explicit_overrides() {
+        let defaults = VmLimits::default();
+        let default_catalog =
+            effective_vm_limits(&defaults, None).expect("serialize default limit catalog");
+        assert!(
+            default_catalog.len() > 100,
+            "catalog should include every limit"
+        );
+        assert!(default_catalog
+            .iter()
+            .all(|limit| !limit.description.is_empty() && !limit.configured));
+
+        let config = VmLimitsConfig {
+            resources: Some(ResourceLimitsConfig {
+                max_processes: Some(17),
+                ..ResourceLimitsConfig::default()
+            }),
+            ..VmLimitsConfig::default()
+        };
+        let effective = vm_limits_from_config(Some(&config), FRAME_CAP).expect("valid override");
+        let catalog =
+            effective_vm_limits(&effective, Some(&config)).expect("serialize overridden catalog");
+        let processes = catalog
+            .iter()
+            .find(|limit| limit.config_path == "limits.resources.maxProcesses")
+            .expect("process limit");
+        assert_eq!(processes.capacity, Some(17));
+        assert!(processes.configured);
+        assert!(catalog
+            .iter()
+            .find(|limit| limit.config_path == "limits.resources.maxOpenFds")
+            .is_some_and(|limit| !limit.configured));
+    }
 
     #[test]
     fn canonical_defaults_are_concrete_and_valid() {

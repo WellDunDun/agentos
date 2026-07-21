@@ -52,16 +52,14 @@ Buffer capacities are sized so that *transient* bursts are absorbed without ever
 engaging backpressure; backpressure is the safety net for a genuinely stuck
 consumer, not a normal-operation event.
 
-## The limit registry
+## The limit catalog and gauges
 
-Live resource and queue gauges register with a single in-process **limit
-registry**. Each registered limit tracks its live depth, high-water mark, and
-capacity, and emits the near-capacity warning described above. This gives the
-runtime one place to answer two questions:
+The sidecar generates a per-VM **limit catalog** from the same typed effective configuration used for enforcement. It therefore includes defaults and explicit overrides without clients or inspector pages maintaining their own list. VM-owned resource and queue gauges contribute current usage, high-water mark, and capacity to the matching catalog entries.
+
+Process-global registration still supports warning emission for internal transport machinery, but it is not exposed as VM usage. A VM snapshot uses only the gauges owned by that VM, so activity from another VM cannot appear in its inspector. This gives the runtime one place to answer two questions:
 
 - *Is a limit about to be hit?* — the registry fires the approach warning.
-- *What is the current usage of everything?* — a registry snapshot lists every
-  limit's depth / high-water / capacity / fill-percent for debugging.
+- *What limits are effective for this VM?* — `AgentOs.getSystemInfo()` returns every catalog entry, with live depth / high-water / capacity / fill-percent where a VM-scoped gauge exists.
 
 A CI audit fails the build if any limit-shaped constant is not classified and —
 for operator-tunable ones — wired to a config field, so "is everything bounded

@@ -533,6 +533,18 @@ export interface Kernel extends KernelInterface {
 			capacity: number;
 			fillPercent: number;
 		}>;
+		limitSnapshots: Array<{
+			name: string;
+			configPath: string;
+			description: string;
+			category: string;
+			unit: string;
+			source: string;
+			used: number | null;
+			highWater: number | null;
+			capacity: number | null;
+			fillPercent: number | null;
+		}>;
 	}>;
 	readonly commands: ReadonlyMap<string, string>;
 	readonly processes: ReadonlyMap<number, ProcessInfo>;

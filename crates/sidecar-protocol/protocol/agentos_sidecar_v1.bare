@@ -664,6 +664,19 @@ type QueueSnapshotEntry struct {
   fillPercent: u64
 }
 
+type LimitSnapshotEntry struct {
+  name: str
+  configPath: str
+  description: str
+  category: str
+  unit: str
+  source: str
+  used: optional<u64>
+  highWater: optional<u64>
+  capacity: optional<u64>
+  fillPercent: optional<u64>
+}
+
 type ResourceSnapshotResponse struct {
   runningProcesses: u64
   exitedProcesses: u64
@@ -680,6 +693,7 @@ type ResourceSnapshotResponse struct {
   socketBufferedBytes: u64
   socketDatagramQueueLen: u64
   queueSnapshots: list<QueueSnapshotEntry>
+  limitSnapshots: list<LimitSnapshotEntry>
 }
 
 type SocketStateEntry struct {

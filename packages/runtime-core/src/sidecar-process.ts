@@ -130,6 +130,19 @@ export interface SidecarQueueSnapshotEntry {
 	fillPercent: number;
 }
 
+export interface SidecarLimitSnapshotEntry {
+	name: string;
+	configPath: string;
+	description: string;
+	category: string;
+	unit: string;
+	source: string;
+	used: number | null;
+	highWater: number | null;
+	capacity: number | null;
+	fillPercent: number | null;
+}
+
 export interface SidecarResourceSnapshot {
 	runningProcesses: number;
 	exitedProcesses: number;
@@ -146,6 +159,7 @@ export interface SidecarResourceSnapshot {
 	socketBufferedBytes: number;
 	socketDatagramQueueLen: number;
 	queueSnapshots: SidecarQueueSnapshotEntry[];
+	limitSnapshots: SidecarLimitSnapshotEntry[];
 }
 
 export interface SidecarZombieTimerCount {
@@ -1460,6 +1474,18 @@ export class SidecarProcess {
 				highWater: queue.high_water,
 				capacity: queue.capacity,
 				fillPercent: queue.fill_percent,
+			})),
+			limitSnapshots: response.payload.limit_snapshots.map((limit) => ({
+				name: limit.name,
+				configPath: limit.config_path,
+				description: limit.description,
+				category: limit.category,
+				unit: limit.unit,
+				source: limit.source,
+				used: limit.used,
+				highWater: limit.high_water,
+				capacity: limit.capacity,
+				fillPercent: limit.fill_percent,
 			})),
 		};
 	}

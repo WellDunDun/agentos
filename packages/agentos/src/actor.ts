@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
 	AgentOs,
 	type AgentExitEvent,
@@ -49,6 +50,47 @@ const ACTOR_SQLITE_INLINE_THRESHOLD = 64 * 1024;
 const ROOT_NAMESPACE = "agentos-root";
 const PREVIEW_PATH_PATTERN = /^\/fetch\/([a-f0-9]{48})(\/.*)?$/;
 const MAX_SQLITE_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+const INSPECTOR_TAB_SOURCE = fileURLToPath(
+	new URL("../assets/inspector-tabs-app", import.meta.url),
+);
+const AGENT_OS_INSPECTOR_TABS = [
+	{
+		id: "software",
+		label: "Software",
+		icon: "box",
+		source: INSPECTOR_TAB_SOURCE,
+	},
+	{
+		id: "processes",
+		label: "Processes",
+		icon: "terminal",
+		source: INSPECTOR_TAB_SOURCE,
+	},
+	{
+		id: "filesystem",
+		label: "Filesystem",
+		icon: "folder",
+		source: INSPECTOR_TAB_SOURCE,
+	},
+	{
+		id: "mounts",
+		label: "Mounts",
+		icon: "hard-drive",
+		source: INSPECTOR_TAB_SOURCE,
+	},
+	{
+		id: "limits",
+		label: "Limits",
+		icon: "gauge",
+		source: INSPECTOR_TAB_SOURCE,
+	},
+	{
+		id: "transcript",
+		label: "Transcript",
+		icon: "message-square",
+		source: INSPECTOR_TAB_SOURCE,
+	},
+] as const;
 
 interface ActorSqliteMigration {
 	readonly version: number;
@@ -837,6 +879,8 @@ export function createAgentOsActions(
 		},
 		listMounts: async (c: AnyContext) =>
 			(await ensureVm(c, options)).listMounts(),
+		getSystemInfo: async (c: AnyContext) =>
+			(await ensureVm(c, options)).getSystemInfo(),
 		listSoftware: async (c: AnyContext) =>
 			(await ensureVm(c, options)).listSoftware(),
 		linkSoftware: async (c: AnyContext, descriptor: PackageDescriptor) => {
@@ -1103,6 +1147,12 @@ export function createAgentOS<
 
 	return actor({
 		...actorConfig,
+		inspector: {
+			tabs: [
+				...(actorConfig.inspector?.tabs ?? []),
+				...AGENT_OS_INSPECTOR_TABS,
+			],
+		},
 		options: {
 			actionTimeout: DEFAULT_ACTION_TIMEOUT_MS,
 			sleepGracePeriod: DEFAULT_SLEEP_GRACE_PERIOD_MS,

@@ -3,7 +3,8 @@ use crate::pipe_manager::PipeManager;
 use crate::process_table::{ProcessStatus, ProcessTable};
 use crate::pty::PtyManager;
 use crate::socket_table::{SocketState, SocketTable};
-use agentos_bridge::queue_tracker::{register_limit, QueueGauge, TrackedLimit};
+use agentos_bridge::queue_tracker::{register_limit, QueueGauge, QueueSnapshot, TrackedLimit};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -52,8 +53,10 @@ pub struct ResourceSnapshot {
     pub socket_datagram_queue_len: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResourceLimits {
+    #[serde(rename = "cpuCount")]
     pub virtual_cpu_count: Option<usize>,
     pub max_processes: Option<usize>,
     pub max_open_fds: Option<usize>,
@@ -241,6 +244,26 @@ impl ResourceGauges {
             ),
         }
     }
+
+    fn snapshots(&self) -> Vec<QueueSnapshot> {
+        [
+            &self.processes,
+            &self.open_fds,
+            &self.pipes,
+            &self.ptys,
+            &self.sockets,
+            &self.connections,
+            &self.socket_buffered_bytes,
+            &self.socket_datagram_queue_len,
+            &self.filesystem_bytes,
+            &self.inodes,
+            &self.recursive_fs_depth,
+            &self.recursive_fs_entries,
+        ]
+        .into_iter()
+        .filter_map(|gauge| gauge.as_ref().map(|gauge| gauge.snapshot()))
+        .collect()
+    }
 }
 
 pub struct ResourceAccountant {
@@ -285,6 +308,10 @@ impl ResourceAccountant {
 
     pub fn limits(&self) -> &ResourceLimits {
         &self.limits
+    }
+
+    pub fn limit_snapshots(&self) -> Vec<QueueSnapshot> {
+        self.gauges.snapshots()
     }
 
     pub fn snapshot(

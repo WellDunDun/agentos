@@ -48,6 +48,19 @@ export interface LiveQueueSnapshotEntry {
 	fill_percent: number;
 }
 
+export interface LiveLimitSnapshotEntry {
+	name: string;
+	config_path: string;
+	description: string;
+	category: string;
+	unit: string;
+	source: string;
+	used: number | null;
+	high_water: number | null;
+	capacity: number | null;
+	fill_percent: number | null;
+}
+
 export interface LiveResourceSnapshot {
 	running_processes: number;
 	exited_processes: number;
@@ -64,6 +77,7 @@ export interface LiveResourceSnapshot {
 	socket_buffered_bytes: number;
 	socket_datagram_queue_len: number;
 	queue_snapshots: LiveQueueSnapshotEntry[];
+	limit_snapshots: LiveLimitSnapshotEntry[];
 }
 
 export interface LiveProjectedCommand {
@@ -497,6 +511,39 @@ export function fromGeneratedResponsePayload(
 						queue.fillPercent,
 						"resource_snapshot.queue.fill_percent",
 					),
+				})),
+				limit_snapshots: payload.val.limitSnapshots.map((limit) => ({
+					name: limit.name,
+					config_path: limit.configPath,
+					description: limit.description,
+					category: limit.category,
+					unit: limit.unit,
+					source: limit.source,
+					used:
+						limit.used === null
+							? null
+							: bigIntToSafeNumber(limit.used, "resource_snapshot.limit.used"),
+					high_water:
+						limit.highWater === null
+							? null
+							: bigIntToSafeNumber(
+									limit.highWater,
+									"resource_snapshot.limit.high_water",
+								),
+					capacity:
+						limit.capacity === null
+							? null
+							: bigIntToSafeNumber(
+									limit.capacity,
+									"resource_snapshot.limit.capacity",
+								),
+					fill_percent:
+						limit.fillPercent === null
+							? null
+							: bigIntToSafeNumber(
+									limit.fillPercent,
+									"resource_snapshot.limit.fill_percent",
+								),
 				})),
 			};
 		case "ListenerSnapshotResponse":

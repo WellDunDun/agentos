@@ -1,5 +1,17 @@
 use super::*;
 
+struct ScopedLimitUsage {
+    name: String,
+    category: String,
+    used: u64,
+    high_water: u64,
+    capacity: u64,
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 pub(super) trait DeferredResponseSettlement<T> {
     fn settle(self, value: T);
 }
@@ -529,22 +541,100 @@ where
             "process://resources",
         )?;
 
-        let snapshot = self
-            .vms
-            .get(&vm_id)
-            .map(|vm| vm.kernel.resource_snapshot())
-            .unwrap_or_default();
-        let queue_snapshots = queue_tracker::queue_snapshot()
+        let vm = self.vms.get(&vm_id).ok_or_else(|| {
+            SidecarError::InvalidState(format!("VM {vm_id} disappeared during inspection"))
+        })?;
+        let snapshot = vm.kernel.resource_snapshot();
+
+        let mut usage_by_path = BTreeMap::new();
+        for resource in ResourceClass::ALL {
+            let Some(limit) = vm.resources.configured_limit(resource) else {
+                continue;
+            };
+            let usage = vm.resources.usage(resource);
+            usage_by_path.insert(
+                limit.config_path,
+                ScopedLimitUsage {
+                    name: resource.name().to_owned(),
+                    category: String::from("resource"),
+                    used: usize_to_u64(usage.used),
+                    high_water: usize_to_u64(usage.high_water),
+                    capacity: usize_to_u64(limit.maximum),
+                },
+            );
+        }
+
+        let mut scoped_gauges = vm.kernel.resource_limit_snapshots();
+        scoped_gauges.push(vm.pending_stdin_bytes_budget.snapshot());
+        scoped_gauges.push(vm.pending_event_bytes_budget.snapshot());
+        for gauge in &scoped_gauges {
+            let Some(config_path) = gauge.name.config_path() else {
+                continue;
+            };
+            usage_by_path.insert(
+                config_path.to_owned(),
+                ScopedLimitUsage {
+                    name: gauge.name.as_str().to_owned(),
+                    category: gauge.category.as_str().to_owned(),
+                    used: usize_to_u64(gauge.depth),
+                    high_water: usize_to_u64(gauge.high_water),
+                    capacity: usize_to_u64(gauge.capacity),
+                },
+            );
+        }
+
+        let queue_snapshots = scoped_gauges
             .into_iter()
             .map(|queue| QueueSnapshotEntry {
                 name: queue.name.as_str().to_owned(),
                 category: queue.category.as_str().to_owned(),
-                depth: queue.depth as u64,
-                high_water: queue.high_water as u64,
-                capacity: queue.capacity as u64,
-                fill_percent: queue.fill_percent as u64,
+                depth: usize_to_u64(queue.depth),
+                high_water: usize_to_u64(queue.high_water),
+                capacity: usize_to_u64(queue.capacity),
+                fill_percent: usize_to_u64(queue.fill_percent),
             })
             .collect();
+
+        let limit_snapshots = agentos_native_sidecar_core::effective_vm_limits(
+            &vm.limits,
+            Some(&vm.configured_limits),
+        )
+        .map_err(|error| SidecarError::InvalidState(error.to_string()))?
+        .into_iter()
+        .map(|limit| {
+            let usage = usage_by_path.remove(&limit.config_path);
+            let used = usage.as_ref().map(|usage| usage.used);
+            let capacity = usage
+                .as_ref()
+                .map(|usage| usage.capacity)
+                .or(limit.capacity);
+            let fill_percent = used.zip(capacity).map(|(used, capacity)| {
+                used.saturating_mul(100).checked_div(capacity).unwrap_or(0)
+            });
+            LimitSnapshotEntry {
+                name: usage
+                    .as_ref()
+                    .map(|usage| usage.name.clone())
+                    .unwrap_or(limit.name),
+                config_path: limit.config_path,
+                description: limit.description,
+                category: usage
+                    .as_ref()
+                    .map(|usage| usage.category.clone())
+                    .unwrap_or_else(|| String::from("unmeasured")),
+                unit: limit.unit,
+                source: if limit.configured {
+                    String::from("configured")
+                } else {
+                    String::from("default")
+                },
+                used,
+                high_water: usage.map(|usage| usage.high_water),
+                capacity,
+                fill_percent,
+            }
+        })
+        .collect();
 
         Ok(DispatchResult {
             response: self.respond(
@@ -565,6 +655,7 @@ where
                     socket_buffered_bytes: snapshot.socket_buffered_bytes as u64,
                     socket_datagram_queue_len: snapshot.socket_datagram_queue_len as u64,
                     queue_snapshots,
+                    limit_snapshots,
                 }),
             ),
             events: Vec::new(),

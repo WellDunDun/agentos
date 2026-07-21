@@ -95,12 +95,12 @@ use crate::protocol::{
     JavascriptDgramCreateSocketRequest, JavascriptDgramSendRequest, JavascriptDnsLookupRequest,
     JavascriptDnsResolveRequest, JavascriptNetBindConnectedUnixRequest,
     JavascriptNetConnectRequest, JavascriptNetListenRequest, JavascriptNetReserveTcpPortRequest,
-    JavascriptPosixSpawnFileAction, JavascriptSpawnHostNetFd, KillProcessRequest, OwnershipScope,
-    ProcessExitedEvent, ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotStatus,
-    PtyResizedResponse, QueueSnapshotEntry, RequestFrame, ResizePtyRequest,
-    ResourceSnapshotResponse, ResponseFrame, ResponsePayload, SidecarRequestPayload,
-    SignalDispositionAction, SignalHandlerRegistration, SocketStateEntry, StreamChannel,
-    VmFetchRequest, VmFetchResponse, WasmPermissionTier, WriteStdinRequest,
+    JavascriptPosixSpawnFileAction, JavascriptSpawnHostNetFd, KillProcessRequest,
+    LimitSnapshotEntry, OwnershipScope, ProcessExitedEvent, ProcessOutputEvent,
+    ProcessSnapshotEntry, ProcessSnapshotStatus, PtyResizedResponse, QueueSnapshotEntry,
+    RequestFrame, ResizePtyRequest, ResourceSnapshotResponse, ResponseFrame, ResponsePayload,
+    SidecarRequestPayload, SignalDispositionAction, SignalHandlerRegistration, SocketStateEntry,
+    StreamChannel, VmFetchRequest, VmFetchResponse, WasmPermissionTier, WriteStdinRequest,
 };
 use crate::service::{
     audit_fields, dirname, emit_security_audit_event, emit_structured_event_or_stderr,

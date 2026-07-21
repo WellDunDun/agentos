@@ -78,6 +78,29 @@ export interface MountInfo {
 	config?: unknown | null;
 }
 
+// ── Limits ────────────────────────────────────────────────────────────
+export type SystemLimitCategory =
+	| "resource"
+	| "queue"
+	| "memory"
+	| "cpu"
+	| "unmeasured";
+export interface SystemLimitInfo {
+	name: string;
+	configPath: string;
+	description: string;
+	category: SystemLimitCategory;
+	unit: string;
+	source: "default" | "configured";
+	used: number | null;
+	highWater: number | null;
+	capacity: number | null;
+	fillPercent: number | null;
+}
+export interface AgentOsSystemInfo {
+	limits: SystemLimitInfo[];
+}
+
 // ── Sessions / transcript ─────────────────────────────────────────────
 export interface SessionInfo {
 	sessionId: string;

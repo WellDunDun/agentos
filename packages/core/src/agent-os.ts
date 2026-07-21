@@ -763,6 +763,33 @@ export interface LimitWarning {
 
 export type LimitWarningHandler = (warning: LimitWarning) => void;
 
+export type SystemLimitSource = "default" | "configured";
+export type SystemLimitCategory =
+	| "queue"
+	| "resource"
+	| "memory"
+	| "cpu"
+	| "unmeasured";
+
+/** One effective VM limit and its live usage when AgentOS can measure it. */
+export interface SystemLimitInfo {
+	name: string;
+	configPath: string;
+	description: string;
+	category: SystemLimitCategory;
+	unit: string;
+	source: SystemLimitSource;
+	used: number | null;
+	highWater: number | null;
+	capacity: number | null;
+	fillPercent: number | null;
+}
+
+/** Sidecar-owned, VM-scoped information used by host tooling and inspectors. */
+export interface AgentOsSystemInfo {
+	limits: SystemLimitInfo[];
+}
+
 /**
  * Public core VM options.
  *
@@ -3339,6 +3366,20 @@ export class AgentOs {
 	async listMounts(): Promise<MountInfo[]> {
 		if (!(this.#kernel instanceof NativeSidecarKernelProxy)) return [];
 		return this.#kernel.listMounts();
+	}
+
+	async getSystemInfo(): Promise<AgentOsSystemInfo> {
+		const snapshot = await this._sidecarClient.getResourceSnapshot(
+			this._sidecarSession,
+			this._sidecarVm,
+		);
+		return {
+			limits: snapshot.limitSnapshots.map((limit) => ({
+				...limit,
+				category: limit.category as SystemLimitCategory,
+				source: limit.source as SystemLimitSource,
+			})),
+		};
 	}
 
 	async move(from: string, to: string): Promise<void> {

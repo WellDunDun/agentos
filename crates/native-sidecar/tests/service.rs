@@ -4692,6 +4692,33 @@ console.log(JSON.stringify({ status: "ok", summary }));
                             .any(|entry| entry.name == "pending_process_events"),
                         "expected sidecar queue gauges in snapshot: {snapshot:?}"
                     );
+                    assert!(
+                        snapshot.limit_snapshots.iter().any(|entry| {
+                            entry.config_path == "limits.resources.maxProcesses"
+                                && entry
+                                    .used
+                                    .is_some_and(|used| used >= snapshot.running_processes)
+                                && entry.high_water.is_some()
+                                && entry.capacity.is_some()
+                                && entry.source == "default"
+                        }),
+                        "expected measured process limit in snapshot: {snapshot:?}"
+                    );
+                    assert!(
+                        snapshot.limit_snapshots.iter().any(|entry| {
+                            entry.config_path == "limits.http.maxFetchResponseBytes"
+                                && entry.used.is_none()
+                                && entry.capacity.is_some()
+                        }),
+                        "expected configuration-only limits in snapshot: {snapshot:?}"
+                    );
+                    assert!(
+                        snapshot
+                            .limit_snapshots
+                            .iter()
+                            .all(|entry| !entry.description.is_empty()),
+                        "every limit must have an inspector description: {snapshot:?}"
+                    );
                 }
                 other => panic!("unexpected resource snapshot response payload: {other:?}"),
             }

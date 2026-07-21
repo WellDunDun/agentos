@@ -274,8 +274,9 @@ where
         let (guest_cwd, host_cwd) = resolve_vm_cwds(create_config.cwd.as_ref(), &cwd)?;
         fs::create_dir_all(&host_cwd)
             .map_err(|error| SidecarError::Io(format!("failed to create VM cwd: {error}")))?;
+        let configured_limits = create_config.limits.clone().unwrap_or_default();
         let limits = crate::limits::vm_limits_from_config(
-            create_config.limits.as_ref(),
+            Some(&configured_limits),
             self.config.max_frame_bytes,
         )?;
         let resource_limits = limits.resources.clone();
@@ -515,6 +516,7 @@ where
                 session_id: session_id.clone(),
                 generation: vm_generation,
                 limits,
+                configured_limits,
                 pending_stdin_bytes_budget,
                 pending_event_bytes_budget,
                 resources: vm_resources,

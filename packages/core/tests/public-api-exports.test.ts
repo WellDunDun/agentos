@@ -27,6 +27,7 @@ import {
 	bindingsSchema,
 	validateBindings,
 	type AgentOsLimits,
+	type AgentOsSystemInfo,
 	type ExecOptions,
 	type HostDirMountPluginConfig,
 	type KernelExecOptions,
@@ -42,6 +43,7 @@ import {
 	type SessionInfo,
 	type SessionStreamEntry,
 	type StdioChannel,
+	type SystemLimitInfo,
 	type TimingMitigation,
 } from "../src/index.js";
 
@@ -108,6 +110,7 @@ describe("root public API exports", () => {
 
 	test("re-exports current public SDK types from the root entrypoint", () => {
 		void (null as AgentOsLimits | null);
+		void (null as AgentOsSystemInfo | null);
 		void (null as ExecOptions | null);
 		void (null as HostDirMountPluginConfig | null);
 		void (null as KernelExecOptions | null);
@@ -123,6 +126,7 @@ describe("root public API exports", () => {
 		void (null as SessionInfo | null);
 		void (null as SessionStreamEntry | null);
 		void (null as StdioChannel | null);
+		void (null as SystemLimitInfo | null);
 		void (null as TimingMitigation | null);
 
 		expect(true).toBe(true);

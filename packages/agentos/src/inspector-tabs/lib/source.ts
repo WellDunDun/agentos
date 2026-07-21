@@ -7,6 +7,7 @@ import { queryOptions } from "@tanstack/react-query";
 import type { SessionStreamEntry } from "@rivet-dev/agentos-core";
 import { callAction } from "./actor-client";
 import type {
+	AgentOsSystemInfo,
 	FileContent,
 	FsEntry,
 	MountInfo,
@@ -196,6 +197,13 @@ export const agentOsSource = {
 		queryOptions({
 			queryKey: k(actorId, "mounts"),
 			queryFn: () => callAction<MountInfo[]>("listMounts", []),
+		}),
+
+	systemInfoQueryOptions: (actorId: string) =>
+		queryOptions({
+			queryKey: k(actorId, "system-info"),
+			queryFn: () => callAction<AgentOsSystemInfo>("getSystemInfo", []),
+			refetchInterval: 5_000,
 		}),
 
 	sessionsQueryOptions: (actorId: string) =>

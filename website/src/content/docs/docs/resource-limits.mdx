@@ -92,8 +92,19 @@ configurable — they are fixed protocol constants.
 
 ## Warnings & observability
 
-Limits are observable, not just enforced. Live resource gauges and internal
-bounded queues are tracked in a central limit registry that:
+Limits are observable, not just enforced. Call `agentOs.getSystemInfo()` to get
+the sidecar-owned catalog for a VM. The response includes every effective limit,
+its configuration path and description, whether it came from an explicit VM
+configuration or the sidecar default, and live usage where the runtime owns a
+VM-scoped gauge. The agentOS inspector renders this same response in its
+**Limits** tab, ordered by percent consumed.
+
+Measured entries include current usage, capacity, fill percent, and a high-water
+mark for the lifetime of that VM. Configuration-only limits such as deadlines
+and per-operation payload caps remain in the catalog with their effective value,
+but report no live usage or high-water mark rather than inventing a gauge.
+
+Live resource gauges and internal bounded queues:
 
 - **Warns before the limit is hit.** As usage crosses ~80% of a cap, the runtime
   emits a structured warning (once per crossing, re-armed only after it recovers),
@@ -103,7 +114,7 @@ bounded queues are tracked in a central limit registry that:
   raise it. A rejected event is not popped and forgotten.
 - **Surfaces through logs.** The agentOS sidecar logs to stderr (stdout is the wire
   protocol); set `AGENTOS_LOG=warn` (the default) to see near-limit warnings
-  or `AGENTOS_LOG=debug` for live per-limit usage snapshots.
+  or inspect the structured system information through the client API.
 
 See [Limits & Observability](/docs/architecture/limits-and-observability) for the
 full architecture.

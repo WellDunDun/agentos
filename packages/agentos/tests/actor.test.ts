@@ -88,6 +88,12 @@ describe("agentOS actor", () => {
 		expect(definition.config.actions).toHaveProperty("deleteSession");
 		expect(definition.config.actions).toHaveProperty("setSessionConfigOption");
 		expect(definition.config.actions).toHaveProperty("listSessions");
+		expect(definition.config.actions).toHaveProperty("getSystemInfo");
+		expect(definition.config.inspector?.tabs).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "limits", label: "Limits" }),
+			]),
+		);
 		expect(definition.config.events).toHaveProperty("countChanged");
 		expect(definition.config.events).toHaveProperty("vmBooted");
 		expect(definition.config.events).toHaveProperty("sessionEvent");

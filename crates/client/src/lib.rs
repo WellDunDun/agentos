@@ -26,6 +26,7 @@ pub mod process;
 pub mod session;
 pub mod sidecar;
 pub mod stream;
+pub mod system_info;
 pub mod transport;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +58,7 @@ pub use sidecar::{
     AgentOsSidecar, AgentOsSidecarDescription, AgentOsSidecarPlacement, SidecarState,
 };
 pub use stream::{ByteStream, Subscription};
+pub use system_info::{AgentOsSystemInfo, SystemLimitCategory, SystemLimitInfo, SystemLimitSource};
 
 pub use config::{
     node_modules_mount, AcpLimits, AgentOsConfig, AgentOsConfigBuilder, AgentOsLimits,

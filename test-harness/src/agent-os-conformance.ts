@@ -42,6 +42,7 @@ export const AGENT_OS_CONFORMANCE_ACTIONS = [
 	"cancelCronJob",
 	"listAgents",
 	"listMounts",
+	"getSystemInfo",
 	"listSoftware",
 	"exportRootFilesystem",
 	"mountFs",
@@ -437,6 +438,15 @@ export function defineAgentOsConformanceSuite(
 					kind: "host_dir",
 					readOnly: true,
 				}),
+			);
+			const systemInfo = await backend.call<any>("getSystemInfo");
+			expect(systemInfo.limits).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						configPath: "limits.resources.maxProcesses",
+						source: expect.stringMatching(/^(default|configured)$/),
+					}),
+				]),
 			);
 			expect(
 				text(

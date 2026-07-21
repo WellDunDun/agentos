@@ -172,6 +172,46 @@ impl TrackedLimit {
             }
         }
     }
+
+    /// Operator-facing VM config leaf that controls this gauge. Internal
+    /// transport-only bounds return `None` and are omitted from VM system-info.
+    pub fn config_path(self) -> Option<&'static str> {
+        match self {
+            TrackedLimit::JavascriptEventChannel
+            | TrackedLimit::PendingProcessEvents
+            | TrackedLimit::PendingExecutionEvents => Some("limits.process.pendingEventCount"),
+            TrackedLimit::PendingProcessEventBytes | TrackedLimit::PendingExecutionEventBytes => {
+                Some("limits.process.pendingEventBytes")
+            }
+            TrackedLimit::PendingKernelStdinBytes => Some("limits.process.pendingStdinBytes"),
+            TrackedLimit::VmProcesses => Some("limits.resources.maxProcesses"),
+            TrackedLimit::VmOpenFds => Some("limits.resources.maxOpenFds"),
+            TrackedLimit::VmPipes => Some("limits.resources.maxPipes"),
+            TrackedLimit::VmPtys => Some("limits.resources.maxPtys"),
+            TrackedLimit::VmSockets => Some("limits.resources.maxSockets"),
+            TrackedLimit::VmConnections => Some("limits.resources.maxConnections"),
+            TrackedLimit::VmSocketBufferedBytes => Some("limits.resources.maxSocketBufferedBytes"),
+            TrackedLimit::VmSocketDatagramQueueLen => {
+                Some("limits.resources.maxSocketDatagramQueueLen")
+            }
+            TrackedLimit::VmFilesystemBytes => Some("limits.resources.maxFilesystemBytes"),
+            TrackedLimit::VmInodes => Some("limits.resources.maxInodeCount"),
+            TrackedLimit::VmRecursiveFsDepth => Some("limits.resources.maxRecursiveFsDepth"),
+            TrackedLimit::VmRecursiveFsEntries => Some("limits.resources.maxRecursiveFsEntries"),
+            TrackedLimit::V8HeapBytes => Some("limits.jsRuntime.v8HeapLimitMb"),
+            TrackedLimit::V8CpuTimeMs => Some("limits.jsRuntime.cpuTimeLimitMs"),
+            TrackedLimit::V8WallClockMs => Some("limits.jsRuntime.wallClockLimitMs"),
+            TrackedLimit::WasmFuelMs => Some("limits.resources.maxWasmFuel"),
+            TrackedLimit::WasmMemoryBytes => Some("limits.resources.maxWasmMemoryBytes"),
+            TrackedLimit::V8SessionFrames
+            | TrackedLimit::SidecarStdinFrames
+            | TrackedLimit::SidecarStdoutFrames
+            | TrackedLimit::CompletedSidecarResponses
+            | TrackedLimit::PendingWasmSignals
+            | TrackedLimit::PendingSidecarResponses
+            | TrackedLimit::OutboundSidecarRequests => None,
+        }
+    }
 }
 
 /// A near-capacity event for one limit, delivered to the global warning sink at
@@ -294,6 +334,20 @@ impl QueueGauge {
     /// Highest depth observed over the gauge's lifetime.
     pub fn high_water(&self) -> usize {
         self.high_water.load(Ordering::Acquire)
+    }
+
+    /// Capture this gauge without going through the process-global registry.
+    /// Owners use this for scope-safe VM/session inspection.
+    pub fn snapshot(&self) -> QueueSnapshot {
+        let depth = self.depth();
+        QueueSnapshot {
+            name: self.name(),
+            category: self.category(),
+            depth,
+            high_water: self.high_water(),
+            capacity: self.capacity(),
+            fill_percent: self.fill_percent(depth),
+        }
     }
 
     /// Fill fraction (0–100) at the given depth. Saturates rather than dividing
@@ -428,17 +482,7 @@ impl QueueRegistry {
         gauges
             .iter()
             .filter_map(Weak::upgrade)
-            .map(|gauge| {
-                let depth = gauge.depth();
-                QueueSnapshot {
-                    name: gauge.name(),
-                    category: gauge.category(),
-                    depth,
-                    high_water: gauge.high_water(),
-                    capacity: gauge.capacity(),
-                    fill_percent: gauge.fill_percent(depth),
-                }
-            })
+            .map(|gauge| gauge.snapshot())
             .collect()
     }
 }

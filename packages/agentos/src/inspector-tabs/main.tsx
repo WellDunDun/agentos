@@ -19,6 +19,8 @@ const TABS: Record<string, () => Promise<{ default: ComponentType<{ actorId: str
 		import("./tabs/filesystem").then((m) => ({ default: m.FilesystemTabConnected })),
 	mounts: () =>
 		import("./tabs/mounts").then((m) => ({ default: m.MountsTabConnected })),
+	limits: () =>
+		import("./tabs/limits").then((m) => ({ default: m.LimitsTabConnected })),
 	transcript: () =>
 		import("./tabs/transcript").then((m) => ({ default: m.TranscriptTabConnected })),
 };

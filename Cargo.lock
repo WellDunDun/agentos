@@ -251,6 +251,7 @@ dependencies = [
  "agentos-vfs-core",
  "agentos-vm-config",
  "base64 0.22.1",
+ "serde",
  "serde_json",
  "webpki-root-certs",
 ]

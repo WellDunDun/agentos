@@ -961,6 +961,8 @@ fn checked_in_bare_schema_covers_all_top_level_frame_payload_types() {
         "StdinClosedResponse",
         "ProcessKilledResponse",
         "ProcessSnapshotResponse",
+        "QueueSnapshotEntry",
+        "LimitSnapshotEntry",
         "ResourceSnapshotResponse",
         "ListenerSnapshotResponse",
         "BoundUdpSnapshotResponse",
