@@ -6,6 +6,8 @@ This is the internals view of how TLS works for guest CLI tools (`curl`, `wget`,
 
 The governing rule: **verification happens in-guest, against a CA bundle shipped inside the VM.** The sidecar is a dumb ciphertext pipe — the untrusted guest never asks the trusted host to authenticate a server on its behalf.
 
+The JavaScript [outbound HTTP middleware](/docs/outbound-http-middleware) path is selected from `fetch` or `node:http(s)` request semantics before a TLS socket exists. It therefore does not add a root certificate, issue leaf certificates, or alter this in-guest trust store. Unmatched HTTPS and raw-socket TLS retain the behavior documented below.
+
 ## Why HTTPS stays on mbedTLS
 
 OpenSSL can be built for agentOS's owned `wasm32-wasip1` sysroot, but it is not the right HTTPS backend for every command:

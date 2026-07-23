@@ -13,6 +13,8 @@ The sandbox permission policy is the kernel-level enforcement layer. Every guest
 
 For the higher-level agent tool-approval layer (human-in-the-loop, auto-approve), see [Approvals](/docs/approvals).
 
+Network permission checks run before [outbound HTTP middleware](/docs/outbound-http-middleware) is invoked. A denied guest request fails with `EACCES` and cannot cause trusted host middleware to run.
+
 ## Defaults and merge semantics
 
 The sandbox is deny-by-default for outward-facing capabilities. When you pass no policy, this baseline applies:

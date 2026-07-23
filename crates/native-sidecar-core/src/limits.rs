@@ -7,8 +7,8 @@
 
 use agentos_kernel::resource_accounting::ResourceLimits;
 use agentos_vm_config::{
-    Http2LimitsConfig, ReactorLimitsConfig, ResourceLimitsConfig, TlsLimitsConfig, UdpLimitsConfig,
-    VmLimitsConfig,
+    Http2LimitsConfig, OutboundHttpLimitsConfig, ReactorLimitsConfig, ResourceLimitsConfig,
+    TlsLimitsConfig, UdpLimitsConfig, VmLimitsConfig,
 };
 
 use crate::SidecarCoreError;
@@ -112,6 +112,9 @@ pub const DEFAULT_HTTP2_MAX_PENDING_COMMANDS: usize = 256;
 pub const DEFAULT_HTTP2_MAX_PENDING_COMMAND_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_HTTP2_MAX_PENDING_EVENTS: usize = 256;
 pub const DEFAULT_HTTP2_MAX_PENDING_EVENT_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_OUTBOUND_HTTP_MAX_EXACT_MIDDLEWARE_ROUTES: usize = 128;
+pub const DEFAULT_OUTBOUND_HTTP_MAX_EXACT_MIDDLEWARE_KEY_BYTES: usize = 255;
+pub const DEFAULT_OUTBOUND_HTTP_MAX_EXACT_MIDDLEWARE_TOTAL_BYTES: usize = 32 * 1024;
 
 /// All operator-tunable VM-scoped limits. Fields are concrete values; the `Default` impls own the
 /// numbers and equal today's hardcoded constants, so unset operator config leaves behavior
@@ -122,6 +125,7 @@ pub struct VmLimits {
     /// Kernel resource limits (existing type, existing `resource.*` keys).
     pub resources: ResourceLimits,
     pub http: HttpLimits,
+    pub outbound_http: OutboundHttpLimits,
     pub udp: UdpLimits,
     pub tls: TlsLimits,
     pub http2: Http2Limits,
@@ -208,6 +212,40 @@ pub fn virtual_os_freemem_bytes(resource_limits: &ResourceLimits) -> u64 {
 pub struct HttpLimits {
     /// Cap on `vm.fetch()` buffered response bodies. Must be `<=` the sidecar wire frame cap.
     pub max_fetch_response_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundHttpLimits {
+    pub max_exact_middleware_routes: usize,
+    pub max_exact_middleware_key_bytes: usize,
+    pub max_exact_middleware_total_bytes: usize,
+    pub max_connections: usize,
+    pub max_in_flight_middleware_invocations: usize,
+    pub max_active_response_streams: usize,
+    pub max_classification_prefix_bytes: usize,
+    pub max_request_target_bytes: usize,
+    pub max_request_header_count: usize,
+    pub max_request_header_bytes: usize,
+    pub max_request_body_bytes: usize,
+    pub max_buffered_request_bytes: usize,
+    pub max_total_buffered_request_bytes: usize,
+    pub max_response_header_count: usize,
+    pub max_response_header_bytes: usize,
+    pub max_buffered_response_bytes: usize,
+    pub max_total_buffered_response_bytes: usize,
+    pub max_chunk_bytes: usize,
+    pub max_client_hello_bytes: usize,
+    pub max_certificate_cache_entries: usize,
+    pub max_certificate_cache_bytes: usize,
+    pub max_pending_certificate_issuance: usize,
+    pub classification_timeout_ms: u64,
+    pub tls_handshake_timeout_ms: u64,
+    pub request_read_idle_timeout_ms: u64,
+    pub connection_idle_timeout_ms: u64,
+    pub middleware_queue_timeout_ms: u64,
+    pub middleware_response_timeout_ms: u64,
+    pub response_idle_timeout_ms: u64,
+    pub downstream_backpressure_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,6 +403,44 @@ impl Default for HttpLimits {
     fn default() -> Self {
         Self {
             max_fetch_response_bytes: DEFAULT_MAX_FETCH_RESPONSE_BYTES,
+        }
+    }
+}
+
+impl Default for OutboundHttpLimits {
+    fn default() -> Self {
+        Self {
+            max_exact_middleware_routes: DEFAULT_OUTBOUND_HTTP_MAX_EXACT_MIDDLEWARE_ROUTES,
+            max_exact_middleware_key_bytes: DEFAULT_OUTBOUND_HTTP_MAX_EXACT_MIDDLEWARE_KEY_BYTES,
+            max_exact_middleware_total_bytes:
+                DEFAULT_OUTBOUND_HTTP_MAX_EXACT_MIDDLEWARE_TOTAL_BYTES,
+            max_connections: 128,
+            max_in_flight_middleware_invocations: 32,
+            max_active_response_streams: 128,
+            max_classification_prefix_bytes: 64 * 1024,
+            max_request_target_bytes: 16 * 1024,
+            max_request_header_count: 128,
+            max_request_header_bytes: 64 * 1024,
+            max_request_body_bytes: 16 * 1024 * 1024,
+            max_buffered_request_bytes: 1024 * 1024,
+            max_total_buffered_request_bytes: 16 * 1024 * 1024,
+            max_response_header_count: 128,
+            max_response_header_bytes: 64 * 1024,
+            max_buffered_response_bytes: 1024 * 1024,
+            max_total_buffered_response_bytes: 16 * 1024 * 1024,
+            max_chunk_bytes: 64 * 1024,
+            max_client_hello_bytes: 64 * 1024,
+            max_certificate_cache_entries: 256,
+            max_certificate_cache_bytes: 8 * 1024 * 1024,
+            max_pending_certificate_issuance: 8,
+            classification_timeout_ms: 10_000,
+            tls_handshake_timeout_ms: 10_000,
+            request_read_idle_timeout_ms: 30_000,
+            connection_idle_timeout_ms: 60_000,
+            middleware_queue_timeout_ms: 5_000,
+            middleware_response_timeout_ms: 300_000,
+            response_idle_timeout_ms: 300_000,
+            downstream_backpressure_timeout_ms: 300_000,
         }
     }
 }
@@ -538,6 +614,9 @@ pub fn vm_limits_from_config(
             http.max_fetch_response_bytes,
             "limits.http.maxFetchResponseBytes",
         )?;
+    }
+    if let Some(outbound_http) = config.outbound_http.as_ref() {
+        apply_outbound_http_limits_config(&mut limits.outbound_http, outbound_http)?;
     }
     if let Some(udp) = config.udp.as_ref() {
         apply_udp_limits_config(&mut limits.udp, udp)?;
@@ -831,6 +910,137 @@ pub fn vm_limits_from_config(
 
     validate_vm_limits(&limits, sidecar_max_frame_bytes)?;
     Ok(limits)
+}
+
+fn apply_outbound_http_limits_config(
+    limits: &mut OutboundHttpLimits,
+    config: &OutboundHttpLimitsConfig,
+) -> Result<(), SidecarCoreError> {
+    macro_rules! usize_limit {
+        ($field:ident, $path:literal) => {
+            set_usize(&mut limits.$field, config.$field, $path)?;
+        };
+    }
+    macro_rules! u64_limit {
+        ($field:ident, $path:literal) => {
+            set_u64(&mut limits.$field, config.$field, $path)?;
+        };
+    }
+    usize_limit!(
+        max_exact_middleware_routes,
+        "limits.outboundHttp.maxExactMiddlewareRoutes"
+    );
+    usize_limit!(
+        max_exact_middleware_key_bytes,
+        "limits.outboundHttp.maxExactMiddlewareKeyBytes"
+    );
+    usize_limit!(
+        max_exact_middleware_total_bytes,
+        "limits.outboundHttp.maxExactMiddlewareTotalBytes"
+    );
+    usize_limit!(max_connections, "limits.outboundHttp.maxConnections");
+    usize_limit!(
+        max_in_flight_middleware_invocations,
+        "limits.outboundHttp.maxInFlightMiddlewareInvocations"
+    );
+    usize_limit!(
+        max_active_response_streams,
+        "limits.outboundHttp.maxActiveResponseStreams"
+    );
+    usize_limit!(
+        max_classification_prefix_bytes,
+        "limits.outboundHttp.maxClassificationPrefixBytes"
+    );
+    usize_limit!(
+        max_request_target_bytes,
+        "limits.outboundHttp.maxRequestTargetBytes"
+    );
+    usize_limit!(
+        max_request_header_count,
+        "limits.outboundHttp.maxRequestHeaderCount"
+    );
+    usize_limit!(
+        max_request_header_bytes,
+        "limits.outboundHttp.maxRequestHeaderBytes"
+    );
+    usize_limit!(
+        max_request_body_bytes,
+        "limits.outboundHttp.maxRequestBodyBytes"
+    );
+    usize_limit!(
+        max_buffered_request_bytes,
+        "limits.outboundHttp.maxBufferedRequestBytes"
+    );
+    usize_limit!(
+        max_total_buffered_request_bytes,
+        "limits.outboundHttp.maxTotalBufferedRequestBytes"
+    );
+    usize_limit!(
+        max_response_header_count,
+        "limits.outboundHttp.maxResponseHeaderCount"
+    );
+    usize_limit!(
+        max_response_header_bytes,
+        "limits.outboundHttp.maxResponseHeaderBytes"
+    );
+    usize_limit!(
+        max_buffered_response_bytes,
+        "limits.outboundHttp.maxBufferedResponseBytes"
+    );
+    usize_limit!(
+        max_total_buffered_response_bytes,
+        "limits.outboundHttp.maxTotalBufferedResponseBytes"
+    );
+    usize_limit!(max_chunk_bytes, "limits.outboundHttp.maxChunkBytes");
+    usize_limit!(
+        max_client_hello_bytes,
+        "limits.outboundHttp.maxClientHelloBytes"
+    );
+    usize_limit!(
+        max_certificate_cache_entries,
+        "limits.outboundHttp.maxCertificateCacheEntries"
+    );
+    usize_limit!(
+        max_certificate_cache_bytes,
+        "limits.outboundHttp.maxCertificateCacheBytes"
+    );
+    usize_limit!(
+        max_pending_certificate_issuance,
+        "limits.outboundHttp.maxPendingCertificateIssuance"
+    );
+    u64_limit!(
+        classification_timeout_ms,
+        "limits.outboundHttp.classificationTimeoutMs"
+    );
+    u64_limit!(
+        tls_handshake_timeout_ms,
+        "limits.outboundHttp.tlsHandshakeTimeoutMs"
+    );
+    u64_limit!(
+        request_read_idle_timeout_ms,
+        "limits.outboundHttp.requestReadIdleTimeoutMs"
+    );
+    u64_limit!(
+        connection_idle_timeout_ms,
+        "limits.outboundHttp.connectionIdleTimeoutMs"
+    );
+    u64_limit!(
+        middleware_queue_timeout_ms,
+        "limits.outboundHttp.middlewareQueueTimeoutMs"
+    );
+    u64_limit!(
+        middleware_response_timeout_ms,
+        "limits.outboundHttp.middlewareResponseTimeoutMs"
+    );
+    u64_limit!(
+        response_idle_timeout_ms,
+        "limits.outboundHttp.responseIdleTimeoutMs"
+    );
+    u64_limit!(
+        downstream_backpressure_timeout_ms,
+        "limits.outboundHttp.downstreamBackpressureTimeoutMs"
+    );
+    Ok(())
 }
 
 fn apply_reactor_limits_config(

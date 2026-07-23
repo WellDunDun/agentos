@@ -21,6 +21,17 @@ function createAbortError2() {
   return error;
 }
 
+function outboundHttpMiddlewareRequest(payload) {
+  if (typeof _outboundHttpRequestRaw !== "function") {
+    return { matched: false };
+  }
+  const result = _outboundHttpRequestRaw.applySync(void 0, [payload]);
+  if (typeof result === "string") {
+    return JSON.parse(result);
+  }
+  return result && typeof result === "object" ? result : { matched: false };
+}
+
 var IncomingMessage = class {
   headers;
   rawHeaders;
@@ -406,6 +417,8 @@ var ClientRequest = class {
   _skipExecute = false;
   _destroyError;
   _errorEmitted = false;
+  _outboundMiddlewareMatched = false;
+  _outboundMiddlewareDispatched = false;
   socket;
   finished = false;
   writable = true;
@@ -670,6 +683,26 @@ var ClientRequest = class {
     if (this._skipExecute) {
       return;
     }
+    const normalizedHeaders = normalizeRequestHeaders(this._options.headers);
+    if (!isRawSocketRequest(this.method, normalizedHeaders) && !this._options.socketPath) {
+      try {
+        const probe = outboundHttpMiddlewareRequest({
+          probe: true,
+          url: this._buildUrl()
+        });
+        if (probe?.matched === true) {
+          this._outboundMiddlewareMatched = true;
+          if (this._ended) {
+            void this._dispatchOutboundMiddleware();
+          }
+          return;
+        }
+      } catch (error) {
+        this._handleSocketError(error instanceof Error ? error : new Error(String(error)));
+        this._emitClose();
+        return;
+      }
+    }
     if (this._agent) {
       this._agent.addRequest(this, this._options);
       return;
@@ -695,6 +728,66 @@ var ClientRequest = class {
       return;
     }
     finish(createHttpRequestSocket(this._options));
+  }
+  async _dispatchOutboundMiddleware() {
+    if (this._outboundMiddlewareDispatched || this.destroyed) {
+      return;
+    }
+    this._outboundMiddlewareDispatched = true;
+    this.headersSent = true;
+    const socket = new FakeSocket({
+      host: this._options.hostname || this._options.host,
+      port: this._options.port
+    });
+    this.socket = socket;
+    this._applyTimeoutToSocket(socket);
+    this._emit("socket", socket);
+    try {
+      const headerPairs = buildRawHttpHeaderPairs(this._headers, this._rawHeaderNames);
+      const bodyBuffer = this._body ? Buffer.from(this._body) : Buffer.alloc(0);
+      const result = outboundHttpMiddlewareRequest({
+        method: this.method,
+        url: this._buildUrl(),
+        headers: headerPairs,
+        bodyBase64: bodyBuffer.length > 0 ? bodyBuffer.toString("base64") : null
+      });
+      if (result?.matched !== true || !result.response) {
+        throw createErrorWithCode(
+          "Outbound HTTP middleware disappeared after route selection",
+          "ERR_AGENTOS_OUTBOUND_MIDDLEWARE_UNAVAILABLE"
+        );
+      }
+      const response = result.response;
+      const res = new IncomingMessage({
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+        body: response.bodyBase64 || "",
+        bodyEncoding: "base64",
+        url: this._buildUrl()
+      });
+      this.finished = true;
+      this._clearTimeout();
+      this._response = res;
+      res.socket = socket;
+      if (this._callback) {
+        this._callback(res);
+      }
+      this._emit("response", res);
+      if (!this._callback && this._listenerCount("response") === 0) {
+        queueMicrotask(() => res.resume());
+      }
+      res.once("end", () => {
+        this._unbindAbortSignal();
+        socket.destroy();
+        this._emitClose();
+      });
+    } catch (error) {
+      this._clearTimeout();
+      this._handleSocketError(error instanceof Error ? error : new Error(String(error)));
+      socket.destroy();
+      this._emitClose();
+    }
   }
   _buildUrl() {
     const opts = this._options;
@@ -875,6 +968,9 @@ var ClientRequest = class {
     this.writableEnded = true;
     this.writableFinished = true;
     queueMicrotask(() => this._emit("finish"));
+    if (this._outboundMiddlewareMatched) {
+      void this._dispatchOutboundMiddleware();
+    }
     return this;
   }
   abort() {
@@ -4727,4 +4823,4 @@ exposeCustomGlobal("_upgradeSocketData", onUpgradeSocketData);
 var https = createHttpModule("https");
 
 exposeCustomGlobal("_httpsModule", https);
-export { Agent, ClientRequest, DirectTunnelSocket, FakeSocket, HTTP_METHODS, HTTP_STATUS_TEXT, HTTP_TOKEN_EXTRA_CHARS, INVALID_REQUEST_PATH_REGEXP, IncomingMessage, Server, ServerCallable, ServerIncomingMessage, ServerResponseBridge, ServerResponseCallable, UpgradeSocket, appendNormalizedHeader, attachHttpServerSocket, buildHostHeader, buildRawHttpHeaderPairs, buildUndiciOrigin, checkInvalidHeaderChar, checkIsHttpToken, cloneStoredHeaderValue, createAbortError2, createBadRequestResponseBuffer, createConnResetError, createErrorWithCode, createHttpModule, createHttpRequestSocket, createInvalidArgTypeError2, createTypeErrorWithCode, createUnsupportedHttpSocketWriteError, debugBridgeNetwork, dispatchConnectRequest, dispatchHttp2CompatibilityRequest, dispatchLoopbackServerRequest, dispatchServerRequest, dispatchSocketBackedServerRequest, dispatchSocketRequest, dispatchUpgradeRequest, finalizeRawHeaderPairs, flattenHeaderPairs, formatReceivedType, getUndiciClientForSocket, hasResponseBody, hasUpgradeRequestHeaders, http, https, isFlatHeaderList, isLoopbackRequestHost, isRawSocketRequest, isSocketReadyForProtocol, joinHeaderValue, nextServerId, normalizeRequestHeaders, normalizeSocketChunk, onHttpServerRequest, onUpgradeSocketData, onUpgradeSocketEnd, parseChunkedBody, parseContentLengthHeader, parseLoopbackRequestBuffer, parseRawHttpResponse, readUndiciReadableBody, serializeHeaderValue, serializeLoopbackResponse, serializeRawHeaderPairs, serializeRawHttpRequest, serverInstances, socketReadyEventNameForProtocol, splitTransferEncodingTokens, upgradeSocketInstances, validateHeaderName, validateHeaderValue, validateRequestMethod, validateRequestPath, waitForRawHttpResponse, waitForRawHttpResponseHead, waitForSocketReadyForProtocol };
+export { Agent, ClientRequest, DirectTunnelSocket, FakeSocket, HTTP_METHODS, HTTP_STATUS_TEXT, HTTP_TOKEN_EXTRA_CHARS, INVALID_REQUEST_PATH_REGEXP, IncomingMessage, Server, ServerCallable, ServerIncomingMessage, ServerResponseBridge, ServerResponseCallable, UpgradeSocket, appendNormalizedHeader, attachHttpServerSocket, buildHostHeader, buildRawHttpHeaderPairs, buildUndiciOrigin, checkInvalidHeaderChar, checkIsHttpToken, cloneStoredHeaderValue, createAbortError2, createBadRequestResponseBuffer, createConnResetError, createErrorWithCode, createHttpModule, createHttpRequestSocket, createInvalidArgTypeError2, createTypeErrorWithCode, createUnsupportedHttpSocketWriteError, debugBridgeNetwork, dispatchConnectRequest, dispatchHttp2CompatibilityRequest, dispatchLoopbackServerRequest, dispatchServerRequest, dispatchSocketBackedServerRequest, dispatchSocketRequest, dispatchUpgradeRequest, finalizeRawHeaderPairs, flattenHeaderPairs, formatReceivedType, getUndiciClientForSocket, hasResponseBody, hasUpgradeRequestHeaders, http, https, isFlatHeaderList, isLoopbackRequestHost, isRawSocketRequest, isSocketReadyForProtocol, joinHeaderValue, nextServerId, normalizeRequestHeaders, normalizeSocketChunk, onHttpServerRequest, onUpgradeSocketData, onUpgradeSocketEnd, outboundHttpMiddlewareRequest, parseChunkedBody, parseContentLengthHeader, parseLoopbackRequestBuffer, parseRawHttpResponse, readUndiciReadableBody, serializeHeaderValue, serializeLoopbackResponse, serializeRawHeaderPairs, serializeRawHttpRequest, serverInstances, socketReadyEventNameForProtocol, splitTransferEncodingTokens, upgradeSocketInstances, validateHeaderName, validateHeaderValue, validateRequestMethod, validateRequestPath, waitForRawHttpResponse, waitForRawHttpResponseHead, waitForSocketReadyForProtocol };

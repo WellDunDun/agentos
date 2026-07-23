@@ -1,8 +1,8 @@
 //! Native compatibility exports for shared VM-scoped runtime limits.
 
 pub use agentos_native_sidecar_core::limits::{
-    validate_vm_limits, AcpLimits, BindingLimits, HttpLimits, JsRuntimeLimits, PluginLimits,
-    ProcessLimits, PythonLimits, SqliteLimits, VmLimits, WasmLimits,
+    validate_vm_limits, AcpLimits, BindingLimits, HttpLimits, JsRuntimeLimits, OutboundHttpLimits,
+    PluginLimits, ProcessLimits, PythonLimits, SqliteLimits, VmLimits, WasmLimits,
     DEFAULT_ACP_MAX_COMPLETED_MESSAGE_BYTES, DEFAULT_ACP_MAX_FALLBACK_CONTINUATION_BYTES,
     DEFAULT_ACP_MAX_HISTORY_PAGE_ENTRIES, DEFAULT_ACP_MAX_PENDING_PERMISSIONS_PER_SESSION,
     DEFAULT_ACP_MAX_PENDING_PERMISSIONS_PER_VM, DEFAULT_ACP_MAX_PERMISSION_OUTCOMES_PER_SESSION,

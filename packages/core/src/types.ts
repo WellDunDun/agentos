@@ -31,6 +31,7 @@ export type {
 	NativeRootFilesystemConfig,
 	OverlayMountConfig,
 	OverlayRootFilesystemConfig,
+	OutboundMiddleware,
 	PlainMountConfig,
 	ProcessTreeNode,
 	ProcessExit,

@@ -7094,6 +7094,20 @@ where
                         let socket_paths = build_javascript_socket_path_context(vm)?;
                         let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
                         let capabilities = vm.capabilities.clone();
+                        let outbound_http = Some(OutboundHttpRuntimeContext {
+                            ownership: OwnershipScope::vm(
+                                vm.connection_id.clone(),
+                                vm.session_id.clone(),
+                                vm_id.to_owned(),
+                            ),
+                            sidecar_requests: self.sidecar_requests.clone(),
+                            registration: vm
+                                .bindings
+                                .get(crate::bindings::OUTBOUND_HTTP_MIDDLEWARE_COLLECTION)
+                                .cloned()
+                                .map(Arc::new),
+                            limits: OutboundHttpRuntimeLimits::from_vm_limits(&vm.limits),
+                        });
                         let Some(root) = vm.active_processes.get_mut(process_id) else {
                             return Ok(Value::Null);
                         };
@@ -7115,6 +7129,7 @@ where
                             process: child,
                             sync_request: &request,
                             capabilities,
+                            outbound_http,
                         })
                         .await
                     };

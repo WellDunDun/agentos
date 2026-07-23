@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use base64::Engine;
+use http_body_util::BodyExt;
 use scc::HashMap as SccHashMap;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -25,9 +27,10 @@ use agentos_sidecar_client::wire;
 use agentos_vm_config as vm_config;
 
 use crate::config::{
-    AgentOsConfig, AgentOsLimits, Binding, Bindings, MountConfig, PermissionMode, Permissions,
-    RootFilesystemConfig, RootFilesystemKind, RootFilesystemMode as ConfigRootFilesystemMode,
-    RootLowerInput, SidecarJsBridgeCall, SidecarJsBridgeCallback, TimerScheduleDriver,
+    outbound_body_from_bytes, AgentOsConfig, AgentOsLimits, Binding, Bindings, MountConfig,
+    OutboundCancellation, OutboundMiddleware, PermissionMode, Permissions, RootFilesystemConfig,
+    RootFilesystemKind, RootFilesystemMode as ConfigRootFilesystemMode, RootLowerInput,
+    SidecarJsBridgeCall, SidecarJsBridgeCallback, TimerScheduleDriver,
 };
 use crate::cron::CronManager;
 use crate::error::ClientError;
@@ -41,6 +44,12 @@ use crate::transport::{SidecarProcess, WireSidecarCallback};
 use agentos_sidecar_client::TransportError;
 
 use once_cell::sync::OnceCell;
+
+const OUTBOUND_HTTP_MIDDLEWARE_COLLECTION: &str = "__agentos_outbound_http_middleware";
+const OUTBOUND_HTTP_CALLBACK_PREFIX: &str = "__agentos_outbound_http_middleware:";
+const OUTBOUND_HTTP_CATCH_ALL_KEY: &str = "*";
+const OUTBOUND_HTTP_CALLBACK_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_OUTBOUND_HTTP_BUFFERED_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Registry entries
@@ -552,6 +561,67 @@ impl AgentOs {
             transport.register_wire_callback("host_callback", host_callback_callback());
         }
 
+        if config.outbound.is_some() || !config.outbound_by_host.is_empty() {
+            let mut callbacks = HashMap::new();
+            let mut middleware_by_callback_key = HashMap::new();
+            if let Some(middleware) = &config.outbound {
+                callbacks.insert(
+                    String::from(OUTBOUND_HTTP_CATCH_ALL_KEY),
+                    outbound_http_callback_definition(),
+                );
+                middleware_by_callback_key.insert(
+                    format!("{OUTBOUND_HTTP_CALLBACK_PREFIX}{OUTBOUND_HTTP_CATCH_ALL_KEY}"),
+                    middleware.clone(),
+                );
+            }
+            for (host, middleware) in &config.outbound_by_host {
+                callbacks.insert(host.clone(), outbound_http_callback_definition());
+                middleware_by_callback_key.insert(
+                    format!("{OUTBOUND_HTTP_CALLBACK_PREFIX}{host}"),
+                    middleware.clone(),
+                );
+            }
+            match transport
+                .request_wire(
+                    wire_vm_ownership(&connection_id, &session_id, &vm_id),
+                    wire::RequestPayload::RegisterHostCallbacksRequest(
+                        wire::RegisterHostCallbacksRequest {
+                            name: String::from(OUTBOUND_HTTP_MIDDLEWARE_COLLECTION),
+                            description: String::from("agentOS outbound HTTP middleware"),
+                            command_aliases: Vec::new(),
+                            registry_command_aliases: Vec::new(),
+                            callbacks,
+                        },
+                    ),
+                )
+                .await?
+            {
+                wire::ResponsePayload::HostCallbacksRegisteredResponse(_) => {}
+                wire::ResponsePayload::RejectedResponse(rejected) => {
+                    return Err(rejected_to_error(rejected));
+                }
+                _ => {
+                    return Err(ClientError::Sidecar(
+                        "unexpected outbound HTTP middleware registration response".to_string(),
+                    ));
+                }
+            }
+            let _ = vm_outbound_middleware().insert(
+                vm_id.clone(),
+                Arc::new(VmOutboundMiddlewareRegistry {
+                    middleware_by_callback_key,
+                    buffered_response_limit_bytes: config
+                        .limits
+                        .as_ref()
+                        .and_then(|limits| limits.outbound_http.as_ref())
+                        .and_then(|limits| limits.max_buffered_response_bytes)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(DEFAULT_OUTBOUND_HTTP_BUFFERED_RESPONSE_LIMIT_BYTES),
+                }),
+            );
+            transport.register_wire_callback("host_callback", host_callback_callback());
+        }
+
         // 7. Lease this VM on the (possibly shared) sidecar, build cron, and assemble the client.
         sidecar.active_vm_count.fetch_add(1, Ordering::SeqCst);
         let lease = AgentOsSidecarVmLease {
@@ -796,6 +866,7 @@ impl AgentOs {
             )
             .await;
         let _ = vm_bindings().remove(&self.inner.vm_id);
+        let _ = vm_outbound_middleware().remove(&self.inner.vm_id);
         let _ = vm_acp_routers().remove(&self.inner.vm_id);
         let _ = session_js_bridge_callbacks().remove(&sidecar_session_key(
             &self.inner.connection_id,
@@ -1442,6 +1513,27 @@ struct VmBindingRegistry {
 
 fn vm_bindings() -> &'static SccHashMap<String, Arc<VmBindingRegistry>> {
     VM_BINDINGS.get_or_init(SccHashMap::new)
+}
+
+static VM_OUTBOUND_MIDDLEWARE: OnceCell<SccHashMap<String, Arc<VmOutboundMiddlewareRegistry>>> =
+    OnceCell::new();
+
+struct VmOutboundMiddlewareRegistry {
+    middleware_by_callback_key: HashMap<String, OutboundMiddleware>,
+    buffered_response_limit_bytes: usize,
+}
+
+fn vm_outbound_middleware() -> &'static SccHashMap<String, Arc<VmOutboundMiddlewareRegistry>> {
+    VM_OUTBOUND_MIDDLEWARE.get_or_init(SccHashMap::new)
+}
+
+fn outbound_http_callback_definition() -> wire::RegisteredHostCallbackDefinition {
+    wire::RegisteredHostCallbackDefinition {
+        description: String::from("agentOS outbound HTTP middleware capability"),
+        input_schema: String::from(r#"{"type":"object","additionalProperties":false}"#),
+        timeout_ms: Some(OUTBOUND_HTTP_CALLBACK_TIMEOUT_MS),
+        examples: Vec::new(),
+    }
 }
 
 /// Process-global map of VM id to client state. The shared ACP host callback
@@ -2373,6 +2465,12 @@ async fn run_host_callback(
         }
     };
     let vm_id = wire_ownership_vm_id(ownership).unwrap_or("");
+    if request
+        .callback_key
+        .starts_with(OUTBOUND_HTTP_CALLBACK_PREFIX)
+    {
+        return run_outbound_http_callback(vm_id, request, input).await;
+    }
     let registry = vm_bindings().read(vm_id, |_, registry| registry.clone());
     let Some(registry) = registry else {
         return wire::HostCallbackResultResponse {
@@ -2440,6 +2538,167 @@ async fn run_host_callback(
             )),
         },
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OutboundHttpCallbackInput {
+    #[serde(rename = "type")]
+    kind: String,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body_base64: Option<String>,
+}
+
+async fn run_outbound_http_callback(
+    vm_id: &str,
+    request: wire::HostCallbackRequest,
+    input: Value,
+) -> wire::HostCallbackResultResponse {
+    let registry = vm_outbound_middleware().read(vm_id, |_, registry| registry.clone());
+    let Some(registry) = registry else {
+        return wire::HostCallbackResultResponse {
+            invocation_id: request.invocation_id,
+            result: None,
+            error: Some(String::from("ERR_AGENTOS_OUTBOUND_MIDDLEWARE_UNAVAILABLE")),
+        };
+    };
+    let Some(middleware) = registry
+        .middleware_by_callback_key
+        .get(&request.callback_key)
+        .cloned()
+    else {
+        return wire::HostCallbackResultResponse {
+            invocation_id: request.invocation_id,
+            result: None,
+            error: Some(String::from("ERR_AGENTOS_OUTBOUND_MIDDLEWARE_UNAVAILABLE")),
+        };
+    };
+    let buffered_response_limit_bytes = registry.buffered_response_limit_bytes;
+    let input: OutboundHttpCallbackInput =
+        match serde_json::from_value::<OutboundHttpCallbackInput>(input) {
+            Ok(input) if input.kind == "outbound_http" => input,
+            Ok(_) | Err(_) => {
+                return wire::HostCallbackResultResponse {
+                    invocation_id: request.invocation_id,
+                    result: None,
+                    error: Some(String::from(
+                        "ERR_AGENTOS_OUTBOUND_MIDDLEWARE_INVALID_REQUEST",
+                    )),
+                };
+            }
+        };
+    let cancellation = OutboundCancellation::new();
+    let invocation_cancellation = cancellation.clone();
+    let invocation = async move {
+        let method = input
+            .method
+            .parse::<http::Method>()
+            .map_err(|error| format!("invalid outbound HTTP method: {error}"))?;
+        let request_is_head = method == http::Method::HEAD;
+        let uri = input
+            .url
+            .parse::<http::Uri>()
+            .map_err(|error| format!("invalid outbound HTTP URL: {error}"))?;
+        let mut builder = http::Request::builder().method(method).uri(uri);
+        for (name, value) in input.headers {
+            builder = builder.header(name, value);
+        }
+        let body = input
+            .body_base64
+            .map(|body| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(body)
+                    .map_err(|error| format!("invalid outbound HTTP body: {error}"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let mut middleware_request = builder
+            .body(outbound_body_from_bytes(body))
+            .map_err(|error| format!("invalid outbound HTTP request: {error}"))?;
+        middleware_request
+            .extensions_mut()
+            .insert(invocation_cancellation);
+        let response = middleware(middleware_request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (parts, body) = response.into_parts();
+        let body = if request_is_head || matches!(parts.status.as_u16(), 204 | 205 | 304) {
+            drop(body);
+            bytes::Bytes::new()
+        } else {
+            collect_outbound_http_response_body(body, buffered_response_limit_bytes).await?
+        };
+        let headers = parts
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                value
+                    .to_str()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                    .map_err(|error| format!("invalid outbound middleware header: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        serde_json::to_string(&serde_json::json!({
+            "status": parts.status.as_u16(),
+            "statusText": parts
+                .extensions
+                .get::<String>()
+                .cloned()
+                .unwrap_or_default(),
+            "headers": headers,
+            "bodyBase64": base64::engine::general_purpose::STANDARD.encode(body),
+        }))
+        .map_err(|error| format!("failed to serialize outbound middleware response: {error}"))
+    };
+
+    match tokio::time::timeout(Duration::from_millis(request.timeout_ms.max(1)), invocation).await {
+        Ok(Ok(result)) => wire::HostCallbackResultResponse {
+            invocation_id: request.invocation_id,
+            result: Some(result),
+            error: None,
+        },
+        Ok(Err(error)) => {
+            cancellation.cancel();
+            wire::HostCallbackResultResponse {
+                invocation_id: request.invocation_id,
+                result: None,
+                error: Some(error),
+            }
+        }
+        Err(_) => {
+            cancellation.cancel();
+            wire::HostCallbackResultResponse {
+                invocation_id: request.invocation_id,
+                result: None,
+                error: Some(format!(
+                    "Outbound HTTP middleware timed out after {}ms",
+                    request.timeout_ms
+                )),
+            }
+        }
+    }
+}
+
+async fn collect_outbound_http_response_body(
+    mut body: crate::config::OutboundResponseBody,
+    max_bytes: usize,
+) -> Result<bytes::Bytes, String> {
+    let mut output = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| error.to_string())?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if output.len().saturating_add(data.len()) > max_bytes {
+            return Err(format!(
+                "limits.outboundHttp.maxBufferedResponseBytes exceeded {max_bytes}; raise limits.outboundHttp.maxBufferedResponseBytes"
+            ));
+        }
+        output.extend_from_slice(&data);
+    }
+    Ok(output.freeze())
 }
 
 #[derive(Debug, Deserialize)]

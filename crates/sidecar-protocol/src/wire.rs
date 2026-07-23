@@ -581,6 +581,7 @@ fn legacy_limits_config(
         reactor: None,
         resources: legacy_has_resource_limits(&resources).then_some(resources),
         http: http.max_fetch_response_bytes.is_some().then_some(http),
+        outbound_http: None,
         udp: None,
         tls: None,
         http2: None,

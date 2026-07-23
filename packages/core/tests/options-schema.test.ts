@@ -71,6 +71,67 @@ describe("AgentOsOptions validation", () => {
 		).toBe(true);
 	});
 
+	test("accepts outbound HTTP middleware functions", () => {
+		const exact = async () => new Response("exact");
+		const fallback = () => new Response("fallback");
+		const parsed = agentOsOptionsSchema.parse({
+			outbound: fallback,
+			outboundByHost: {
+				"api.example.com": exact,
+			},
+		});
+
+		expect(parsed.outbound).toBe(fallback);
+		expect(parsed.outboundByHost?.["api.example.com"]).toBe(exact);
+	});
+
+	test("rejects non-function outbound HTTP middleware", () => {
+		expect(() =>
+			agentOsOptionsSchema.parse({
+				outbound: "https://proxy.example",
+			}),
+		).toThrow(/outbound/);
+		expect(() =>
+			agentOsOptionsSchema.parse({
+				outboundByHost: {
+					"api.example.com": { url: "https://proxy.example" },
+				},
+			}),
+		).toThrow(/outboundByHost/);
+	});
+
+	test("validates outbound HTTP limits as positive integers", () => {
+		expect(
+			agentOsOptionsSchema.safeParse({
+				limits: {
+					outboundHttp: {
+						maxExactMiddlewareRoutes: 8,
+						maxBufferedResponseBytes: 1024,
+						middlewareResponseTimeoutMs: 30_000,
+					},
+				},
+			}).success,
+		).toBe(true);
+		expect(() =>
+			agentOsOptionsSchema.parse({
+				limits: {
+					outboundHttp: {
+						maxBufferedResponseBytes: 0,
+					},
+				},
+			}),
+		).toThrow(/maxBufferedResponseBytes/);
+		expect(() =>
+			agentOsOptionsSchema.parse({
+				limits: {
+					outboundHttp: {
+						maxChunkBytes: 1.5,
+					},
+				},
+			}),
+		).toThrow(/maxChunkBytes/);
+	});
+
 	test("accepts a sandbox provider as a public VM option", () => {
 		expect(
 			agentOsOptionsSchema.safeParse({

@@ -263,6 +263,7 @@ pub(crate) struct JavascriptSyncRpcServiceRequest<'a, B> {
     pub(crate) process: &'a mut ActiveProcess,
     pub(crate) sync_request: &'a JavascriptSyncRpcRequest,
     pub(crate) capabilities: CapabilityRegistry,
+    pub(crate) outbound_http: Option<OutboundHttpRuntimeContext>,
 }
 
 pub(crate) enum JavascriptSyncRpcServiceResponse {
@@ -624,6 +625,7 @@ where
         process,
         sync_request: original_request,
         capabilities,
+        outbound_http,
     } = request;
     let remapped_request = remap_wasm_process_sync_rpc(original_request)?;
     let request = remapped_request.as_ref().unwrap_or(original_request);
@@ -751,6 +753,23 @@ where
         | "crypto.subtle" => service_javascript_crypto_sync_rpc(process, request),
         "dns.lookup" | "dns.resolve" | "dns.resolve4" | "dns.resolve6" | "dns.resolveRawRr" => {
             service_javascript_dns_sync_rpc(bridge, kernel, vm_id, dns, request)
+        }
+        "http.outbound_request" => {
+            let Some(outbound_http) = outbound_http else {
+                return Ok(json!({ "matched": false }).into());
+            };
+            let payload = request.args.first().cloned().ok_or_else(|| {
+                SidecarError::InvalidState(String::from(
+                    "http.outbound_request requires a request payload",
+                ))
+            })?;
+            return dispatch_outbound_http_bridge_request(
+                bridge,
+                vm_id,
+                process,
+                outbound_http,
+                payload,
+            );
         }
         "net.http_listen" | "net.http_close" | "net.http_wait" | "net.http_respond" => {
             return service_javascript_net_sync_rpc_response(JavascriptNetSyncRpcServiceRequest {

@@ -1,7 +1,7 @@
 import { getSecureExecUndiciDispatcher, undiciFetch } from "./undici.js";
 import { exposeCustomGlobal, exposeInstallCompatibleHardenedGlobal } from "../global-exposure.js";
 import { undiciHeadersModule, undiciRequestModule, undiciResponseModule } from "../prelude.js";
-import { isFlatHeaderList, onUpgradeSocketEnd } from "./http.js";
+import { isFlatHeaderList, onUpgradeSocketEnd, outboundHttpMiddlewareRequest } from "./http.js";
 
 var MAX_HTTP_BODY_BYTES = 50 * 1024 * 1024;
 
@@ -112,6 +112,33 @@ async function fetch(input, options = {}) {
   // host->guest socket event push keeps pooled connections live.
   const fetchDispatcher = normalizedOptions.dispatcher == null && typeof getSecureExecUndiciDispatcher === "function" ? getSecureExecUndiciDispatcher() : null;
   try {
+    const probe = outboundHttpMiddlewareRequest({
+      probe: true,
+      url: requestLabel
+    });
+    if (probe?.matched === true) {
+      const middlewareRequest = new UndiciRequest(resolvedInput, normalizedOptions);
+      const bodyBytes = middlewareRequest.body == null
+        ? new Uint8Array()
+        : new Uint8Array(await middlewareRequest.arrayBuffer());
+      const result = outboundHttpMiddlewareRequest({
+        method: middlewareRequest.method,
+        url: middlewareRequest.url,
+        headers: Array.from(middlewareRequest.headers.entries()),
+        bodyBase64: bodyBytes.byteLength > 0 ? Buffer.from(bodyBytes).toString("base64") : null
+      });
+      if (result?.matched !== true || !result.response) {
+        throw new Error("ERR_AGENTOS_OUTBOUND_MIDDLEWARE_UNAVAILABLE: middleware disappeared after route selection");
+      }
+      const responseBody = result.response.bodyBase64
+        ? Buffer.from(result.response.bodyBase64, "base64")
+        : null;
+      return new UndiciResponse(responseBody, {
+        status: result.response.status,
+        statusText: result.response.statusText,
+        headers: result.response.headers
+      });
+    }
     return await undiciFetch(
       resolvedInput,
       fetchDispatcher ? { ...normalizedOptions, dispatcher: fetchDispatcher } : normalizedOptions

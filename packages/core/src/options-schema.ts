@@ -5,6 +5,7 @@ import type {
 	AgentStderrHandler,
 	LimitWarningHandler,
 	NativeMountConfig,
+	OutboundMiddleware,
 } from "./agent-os.js";
 import type { Binding, Bindings } from "./bindings.js";
 
@@ -137,6 +138,41 @@ export const agentOsLimitsSchema = z
 			.optional(),
 		http: z
 			.object({ maxFetchResponseBytes: positiveInteger.optional() })
+			.strict()
+			.optional(),
+		outboundHttp: z
+			.object({
+				maxExactMiddlewareRoutes: positiveInteger.optional(),
+				maxExactMiddlewareKeyBytes: positiveInteger.optional(),
+				maxExactMiddlewareTotalBytes: positiveInteger.optional(),
+				maxConnections: positiveInteger.optional(),
+				maxInFlightMiddlewareInvocations: positiveInteger.optional(),
+				maxActiveResponseStreams: positiveInteger.optional(),
+				maxClassificationPrefixBytes: positiveInteger.optional(),
+				maxRequestTargetBytes: positiveInteger.optional(),
+				maxRequestHeaderCount: positiveInteger.optional(),
+				maxRequestHeaderBytes: positiveInteger.optional(),
+				maxRequestBodyBytes: positiveInteger.optional(),
+				maxBufferedRequestBytes: positiveInteger.optional(),
+				maxTotalBufferedRequestBytes: positiveInteger.optional(),
+				maxResponseHeaderCount: positiveInteger.optional(),
+				maxResponseHeaderBytes: positiveInteger.optional(),
+				maxBufferedResponseBytes: positiveInteger.optional(),
+				maxTotalBufferedResponseBytes: positiveInteger.optional(),
+				maxChunkBytes: positiveInteger.optional(),
+				maxClientHelloBytes: positiveInteger.optional(),
+				maxCertificateCacheEntries: positiveInteger.optional(),
+				maxCertificateCacheBytes: positiveInteger.optional(),
+				maxPendingCertificateIssuance: positiveInteger.optional(),
+				classificationTimeoutMs: positiveInteger.optional(),
+				tlsHandshakeTimeoutMs: positiveInteger.optional(),
+				requestReadIdleTimeoutMs: positiveInteger.optional(),
+				connectionIdleTimeoutMs: positiveInteger.optional(),
+				middlewareQueueTimeoutMs: positiveInteger.optional(),
+				middlewareResponseTimeoutMs: positiveInteger.optional(),
+				responseIdleTimeoutMs: positiveInteger.optional(),
+				downstreamBackpressureTimeoutMs: positiveInteger.optional(),
+			})
 			.strict()
 			.optional(),
 		bindings: z
@@ -405,6 +441,19 @@ export const agentOsOptionFieldSchemas = {
 		})
 		.optional(),
 	bindings: z.array(bindingsSchema).optional(),
+	outbound: z
+		.custom<OutboundMiddleware>((value) => typeof value === "function", {
+			message: "Expected function",
+		})
+		.optional(),
+	outboundByHost: z
+		.record(
+			z.string(),
+			z.custom<OutboundMiddleware>((value) => typeof value === "function", {
+				message: "Expected function",
+			}),
+		)
+		.optional(),
 	permissions: permissionsSchema.optional(),
 	sidecar: sidecarConfigSchema.optional(),
 	limits: agentOsLimitsSchema.optional(),

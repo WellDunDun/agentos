@@ -88,6 +88,10 @@
       "title": "Node.js Runtime",
       "description": "Run Node.js in agentOS: native V8 acceleration, the node CLI, installing packages, and Node.js compatibility."
     },
+    "/docs/docs/outbound-http-middleware": {
+      "title": "Outbound HTTP Middleware",
+      "description": "Inspect, mutate, forward, or answer HTTP requests made by code inside an agentOS VM."
+    },
     "/docs/docs/permissions": {
       "title": "Permissions",
       "description": "The per-scope kernel permission policy that gates every guest syscall in the sandbox."

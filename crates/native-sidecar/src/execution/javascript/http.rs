@@ -295,6 +295,7 @@ where
                 process,
                 sync_request: &request,
                 capabilities: capabilities.clone(),
+                outbound_http: None,
             })
             .await;
             match response {
@@ -767,6 +768,7 @@ where
                     process,
                     sync_request: &request,
                     capabilities: capabilities.clone(),
+                    outbound_http: None,
                 })
                 .await;
                 match response {

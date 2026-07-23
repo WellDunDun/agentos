@@ -28,9 +28,14 @@ use agentos_vm_config::PermissionMode;
 use serde_json::{json, Map, Number, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::Ipv6Addr;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use url::Host;
 
+pub(crate) const OUTBOUND_HTTP_MIDDLEWARE_COLLECTION: &str = "__agentos_outbound_http_middleware";
+pub(crate) const OUTBOUND_HTTP_CATCH_ALL_KEY: &str = "*";
 #[derive(Debug)]
 pub(crate) enum BindingCommandResolution {
     Invoke {
@@ -59,6 +64,10 @@ where
 {
     let (connection_id, session_id, vm_id) = sidecar.vm_scope_for(&request.ownership)?;
     sidecar.require_owned_vm(&connection_id, &session_id, &vm_id)?;
+
+    if payload.name == OUTBOUND_HTTP_MIDDLEWARE_COLLECTION {
+        return register_outbound_http_middleware(sidecar, request, payload, &vm_id);
+    }
 
     validate_bindings_registration(&payload)?;
 
@@ -119,6 +128,146 @@ where
         ),
         events: Vec::new(),
     })
+}
+
+fn register_outbound_http_middleware<B>(
+    sidecar: &mut NativeSidecar<B>,
+    request: &RequestFrame,
+    payload: RegisterHostCallbacksRequest,
+    vm_id: &str,
+) -> Result<DispatchResult, SidecarError>
+where
+    B: NativeSidecarBridge + Send + 'static,
+    BridgeError<B>: fmt::Debug + Send + Sync + 'static,
+{
+    if !payload.command_aliases.is_empty() || !payload.registry_command_aliases.is_empty() {
+        return Err(SidecarError::InvalidState(String::from(
+            "outbound HTTP middleware registration cannot expose guest commands",
+        )));
+    }
+    let configured_limits = &sidecar
+        .vms
+        .get(vm_id)
+        .expect("owned VM should exist")
+        .limits
+        .outbound_http;
+    let max_routes = configured_limits.max_exact_middleware_routes;
+    let max_key_bytes = configured_limits.max_exact_middleware_key_bytes;
+    let max_total_bytes = configured_limits.max_exact_middleware_total_bytes;
+    let exact_count = payload
+        .callbacks
+        .keys()
+        .filter(|key| key.as_str() != OUTBOUND_HTTP_CATCH_ALL_KEY)
+        .count();
+    if exact_count > max_routes {
+        return Err(SidecarError::InvalidState(format!(
+            "limits.outboundHttp.maxExactMiddlewareRoutes exceeded {max_routes}; raise limits.outboundHttp.maxExactMiddlewareRoutes"
+        )));
+    }
+    let mut canonical_routes = BTreeSet::new();
+    let mut total_route_bytes = 0usize;
+    for raw_key in payload.callbacks.keys() {
+        if raw_key == OUTBOUND_HTTP_CATCH_ALL_KEY {
+            continue;
+        }
+        let canonical = canonical_outbound_http_host(raw_key)?;
+        if canonical.len() > max_key_bytes {
+            return Err(SidecarError::InvalidState(format!(
+                "limits.outboundHttp.maxExactMiddlewareKeyBytes exceeded {max_key_bytes}; raise limits.outboundHttp.maxExactMiddlewareKeyBytes"
+            )));
+        }
+        total_route_bytes = total_route_bytes.saturating_add(canonical.len());
+        if total_route_bytes > max_total_bytes {
+            return Err(SidecarError::InvalidState(format!(
+                "limits.outboundHttp.maxExactMiddlewareTotalBytes exceeded {max_total_bytes}; raise limits.outboundHttp.maxExactMiddlewareTotalBytes"
+            )));
+        }
+        if !canonical_routes.insert(canonical.clone()) {
+            return Err(SidecarError::InvalidState(format!(
+                "duplicate outbound HTTP middleware host after canonicalization: {canonical}"
+            )));
+        }
+    }
+
+    let vm = sidecar.vms.get_mut(vm_id).expect("owned VM should exist");
+    if vm
+        .bindings
+        .contains_key(OUTBOUND_HTTP_MIDDLEWARE_COLLECTION)
+    {
+        return Err(SidecarError::InvalidState(String::from(
+            "outbound HTTP middleware is already registered for this VM generation",
+        )));
+    }
+    let registration = payload.name.clone();
+    vm.bindings.insert(registration.clone(), payload);
+    Ok(DispatchResult {
+        response: sidecar.respond(
+            request,
+            ResponsePayload::HostCallbacksRegistered(HostCallbacksRegisteredResponse {
+                registration,
+                command_count: 0,
+            }),
+        ),
+        events: Vec::new(),
+    })
+}
+
+pub(crate) fn canonical_outbound_http_host(raw: &str) -> Result<String, SidecarError> {
+    if raw.is_empty()
+        || raw.contains(['/', '@', '?', '#', '*'])
+        || raw.starts_with('[')
+        || raw.ends_with(']')
+    {
+        return Err(SidecarError::InvalidState(format!(
+            "invalid outbound HTTP middleware host key: {raw:?}"
+        )));
+    }
+    let without_trailing_dot = raw.strip_suffix('.').unwrap_or(raw);
+    if without_trailing_dot.is_empty() || without_trailing_dot.ends_with('.') {
+        return Err(SidecarError::InvalidState(format!(
+            "invalid outbound HTTP middleware host key: {raw:?}"
+        )));
+    }
+    if without_trailing_dot.contains(':') {
+        return Ipv6Addr::from_str(without_trailing_dot)
+            .map(|address| address.to_string())
+            .map_err(|error| {
+                SidecarError::InvalidState(format!(
+                    "invalid outbound HTTP middleware host key {raw:?}: {error}"
+                ))
+            });
+    }
+    let host = Host::parse(without_trailing_dot).map_err(|error| {
+        SidecarError::InvalidState(format!(
+            "invalid outbound HTTP middleware host key {raw:?}: {error}"
+        ))
+    })?;
+    Ok(match host {
+        Host::Domain(domain) => domain.to_ascii_lowercase(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+pub(crate) fn select_outbound_http_middleware_registration(
+    registration: &RegisterHostCallbacksRequest,
+    host: &str,
+) -> Result<Option<String>, SidecarError> {
+    let canonical_host = canonical_outbound_http_host(host)?;
+    for raw_key in registration.callbacks.keys() {
+        if raw_key == OUTBOUND_HTTP_CATCH_ALL_KEY {
+            continue;
+        }
+        if canonical_outbound_http_host(raw_key)? == canonical_host {
+            return Ok(Some(format!(
+                "{OUTBOUND_HTTP_MIDDLEWARE_COLLECTION}:{raw_key}"
+            )));
+        }
+    }
+    Ok(registration
+        .callbacks
+        .contains_key(OUTBOUND_HTTP_CATCH_ALL_KEY)
+        .then(|| format!("{OUTBOUND_HTTP_MIDDLEWARE_COLLECTION}:{OUTBOUND_HTTP_CATCH_ALL_KEY}")))
 }
 
 fn refresh_binding_registry(vm: &mut VmState) -> Result<(), SidecarError> {
@@ -938,6 +1087,103 @@ mod tests {
             SidecarError::Conflict(String::from(
                 "binding collection already registered: browser",
             ))
+        );
+    }
+
+    fn outbound_registration(keys: &[&str]) -> RegisterHostCallbacksRequest {
+        RegisterHostCallbacksRequest {
+            name: String::from(OUTBOUND_HTTP_MIDDLEWARE_COLLECTION),
+            description: String::from("Outbound HTTP middleware"),
+            command_aliases: Vec::new(),
+            registry_command_aliases: Vec::new(),
+            callbacks: keys
+                .iter()
+                .map(|key| {
+                    (
+                        (*key).to_owned(),
+                        RegisteredHostCallbackDefinition {
+                            description: String::from("Test outbound route"),
+                            input_schema: String::from(r#"{"type":"object"}"#),
+                            timeout_ms: Some(30_000),
+                            examples: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn canonicalizes_outbound_http_host_keys() {
+        assert_eq!(
+            canonical_outbound_http_host("API.Example.COM.").expect("domain"),
+            "api.example.com"
+        );
+        assert_eq!(
+            canonical_outbound_http_host("192.168.001.001").expect("IPv4-shaped domain"),
+            "192.168.1.1"
+        );
+        assert_eq!(
+            canonical_outbound_http_host("2001:0db8::1").expect("IPv6"),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            canonical_outbound_http_host("BÜCHER.example").expect("IDNA domain"),
+            "xn--bcher-kva.example"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_outbound_http_host_keys() {
+        for invalid in [
+            "",
+            "*.",
+            "*.example.com",
+            "https://example.com",
+            "example.com:443",
+            "user@example.com",
+            "[2001:db8::1]",
+            "example.com/path",
+            "example.com..",
+        ] {
+            assert!(
+                canonical_outbound_http_host(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn selects_exact_outbound_route_before_catch_all() {
+        let registration = outbound_registration(&["*", "API.Example.COM."]);
+        assert_eq!(
+            select_outbound_http_middleware_registration(&registration, "api.example.com")
+                .expect("route"),
+            Some(format!(
+                "{OUTBOUND_HTTP_MIDDLEWARE_COLLECTION}:API.Example.COM."
+            ))
+        );
+        assert_eq!(
+            select_outbound_http_middleware_registration(&registration, "other.example")
+                .expect("fallback"),
+            Some(format!(
+                "{OUTBOUND_HTTP_MIDDLEWARE_COLLECTION}:{OUTBOUND_HTTP_CATCH_ALL_KEY}"
+            ))
+        );
+    }
+
+    #[test]
+    fn exact_outbound_route_matches_all_ports_but_not_subdomains() {
+        let registration = outbound_registration(&["example.com"]);
+        assert_eq!(
+            select_outbound_http_middleware_registration(&registration, "EXAMPLE.COM.")
+                .expect("case-insensitive match"),
+            Some(format!("{OUTBOUND_HTTP_MIDDLEWARE_COLLECTION}:example.com"))
+        );
+        assert_eq!(
+            select_outbound_http_middleware_registration(&registration, "api.example.com")
+                .expect("subdomain"),
+            None
         );
     }
 }

@@ -10,6 +10,8 @@ This is the internals view of agentOS networking: the kernel socket table, the l
 
 The governing rule for TCP is that there is exactly **one authoritative transport for everything VM-local**: the kernel socket table. No untrusted guest code opens a host socket directly. Guest `fetch()`, `node:http`, TCP `node:net`, WASM TCP clients and servers, and host-into-guest requests (`httpRequest` / `rt.fetch`) all target the same listener table. The trusted sidecar implements `AF_UNIX` streams with a separate, per-VM private host transport while keeping pathname inodes and permissions authoritative in the guest VFS.
 
+Guest JavaScript HTTP clients have one additional pre-connect interception point. When [outbound HTTP middleware](/docs/outbound-http-middleware) is configured, the sidecar canonicalizes the logical URL authority, checks `network.http` permission, selects the exact-host or catch-all route, and invokes the VM-scoped host callback. A selected route never opens an upstream socket; an unmatched request continues into the ordinary kernel TCP/TLS path. HTTPS is selected from the semantic request before TLS starts, so this implementation does not terminate or re-sign guest TLS.
+
 ## The kernel socket table
 
 The socket table is the floor of the stack and the only component that actually moves bytes between two in-VM endpoints. It is per VM, so two VMs never share a listener or a connection.

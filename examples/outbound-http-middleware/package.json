@@ -1,0 +1,16 @@
+{
+	"name": "@rivet-dev/agentos-example-outbound-http-middleware",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check-types": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@rivet-dev/agentos-core": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/node": "^22.10.2",
+		"typescript": "^5.7.2"
+	}
+}

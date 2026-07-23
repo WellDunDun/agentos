@@ -8,12 +8,84 @@
 //! only and become `Arc<dyn ...>` trait objects; they cannot cross the wire and are gated exactly as
 //! the actor layer gates them.
 
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::{Stream, StreamExt};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::fs::VirtualFileSystem;
 pub use agentos_vm_config::{VmGroupConfig, VmUserAccountConfig, VmUserConfig};
+
+pub type OutboundBodyError = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type OutboundMiddlewareError = OutboundBodyError;
+pub type OutboundRequestBody = BoxBody<Bytes, OutboundBodyError>;
+pub type OutboundResponseBody = BoxBody<Bytes, OutboundBodyError>;
+pub type OutboundMiddleware = Arc<
+    dyn Fn(
+            http::Request<OutboundRequestBody>,
+        ) -> BoxFuture<
+            'static,
+            Result<http::Response<OutboundResponseBody>, OutboundMiddlewareError>,
+        > + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+pub struct OutboundCancellation {
+    token: CancellationToken,
+}
+
+impl OutboundCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+        }
+    }
+
+    pub async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.token.cancel();
+    }
+}
+
+fn infallible_body_error(error: Infallible) -> OutboundBodyError {
+    match error {}
+}
+
+pub fn outbound_empty_body() -> OutboundResponseBody {
+    Empty::<Bytes>::new().map_err(infallible_body_error).boxed()
+}
+
+pub fn outbound_body_from_bytes(bytes: impl Into<Bytes>) -> OutboundResponseBody {
+    Full::new(bytes.into())
+        .map_err(infallible_body_error)
+        .boxed()
+}
+
+pub fn outbound_body_from_stream<S, E>(stream: S) -> OutboundResponseBody
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    BodyExt::boxed(StreamBody::new(stream.map(|item| {
+        item.map(http_body::Frame::data)
+            .map_err(|error| Box::new(error) as OutboundBodyError)
+    })))
+}
 
 /// Resolved client options (= TS `AgentOsOptions`). All fields optional with documented defaults.
 ///
@@ -50,6 +122,10 @@ pub struct AgentOsConfig {
     pub schedule_driver: Option<Arc<dyn ScheduleDriver>>,
     /// Binding collections to register.
     pub bindings: Vec<Bindings>,
+    /// Catch-all host middleware for classifiable outbound HTTP.
+    pub outbound: Option<OutboundMiddleware>,
+    /// Exact hostname or IP routes. Exact routes take precedence over `outbound`.
+    pub outbound_by_host: BTreeMap<String, OutboundMiddleware>,
     /// Rust-only sidecar callback handler for `js_bridge`-style plugin requests.
     pub sidecar_js_bridge_callback: Option<SidecarJsBridgeCallback>,
     /// Permission policy. Default: allow-all.
@@ -128,6 +204,16 @@ impl AgentOsConfigBuilder {
 
     pub fn bindings(mut self, bindings: Vec<Bindings>) -> Self {
         self.config.bindings = bindings;
+        self
+    }
+
+    pub fn outbound(mut self, middleware: OutboundMiddleware) -> Self {
+        self.config.outbound = Some(middleware);
+        self
+    }
+
+    pub fn outbound_by_host(mut self, middleware: BTreeMap<String, OutboundMiddleware>) -> Self {
+        self.config.outbound_by_host = middleware;
         self
     }
 
@@ -266,6 +352,12 @@ pub struct AgentOsLimits {
     pub resources: Option<ResourceLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpLimits>,
+    #[serde(
+        default,
+        rename = "outboundHttp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub outbound_http: Option<OutboundHttpLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bindings: Option<BindingLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -404,6 +496,41 @@ pub struct HttpLimits {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_fetch_response_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboundHttpLimits {
+    pub max_exact_middleware_routes: Option<u64>,
+    pub max_exact_middleware_key_bytes: Option<u64>,
+    pub max_exact_middleware_total_bytes: Option<u64>,
+    pub max_connections: Option<u64>,
+    pub max_in_flight_middleware_invocations: Option<u64>,
+    pub max_active_response_streams: Option<u64>,
+    pub max_classification_prefix_bytes: Option<u64>,
+    pub max_request_target_bytes: Option<u64>,
+    pub max_request_header_count: Option<u64>,
+    pub max_request_header_bytes: Option<u64>,
+    pub max_request_body_bytes: Option<u64>,
+    pub max_buffered_request_bytes: Option<u64>,
+    pub max_total_buffered_request_bytes: Option<u64>,
+    pub max_response_header_count: Option<u64>,
+    pub max_response_header_bytes: Option<u64>,
+    pub max_buffered_response_bytes: Option<u64>,
+    pub max_total_buffered_response_bytes: Option<u64>,
+    pub max_chunk_bytes: Option<u64>,
+    pub max_client_hello_bytes: Option<u64>,
+    pub max_certificate_cache_entries: Option<u64>,
+    pub max_certificate_cache_bytes: Option<u64>,
+    pub max_pending_certificate_issuance: Option<u64>,
+    pub classification_timeout_ms: Option<u64>,
+    pub tls_handshake_timeout_ms: Option<u64>,
+    pub request_read_idle_timeout_ms: Option<u64>,
+    pub connection_idle_timeout_ms: Option<u64>,
+    pub middleware_queue_timeout_ms: Option<u64>,
+    pub middleware_response_timeout_ms: Option<u64>,
+    pub response_idle_timeout_ms: Option<u64>,
+    pub downstream_backpressure_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

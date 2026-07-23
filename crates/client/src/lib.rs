@@ -59,15 +59,17 @@ pub use sidecar::{
 pub use stream::{ByteStream, Subscription};
 
 pub use config::{
-    node_modules_mount, AcpLimits, AgentOsConfig, AgentOsConfigBuilder, AgentOsLimits,
-    AgentOsSidecarConfig, Binding, BindingCallback, BindingLimits, Bindings, FsPermissionRule,
-    FsPermissions, HttpLimits, JsRuntimeLimits, MountConfig, MountPlugin, OverlayMountConfig,
-    PackageRef, PatternPermissionRule, PatternPermissions, PermissionMode, Permissions,
-    PluginLimits, PythonLimits, ResourceLimits, RootFilesystemConfig, RootFilesystemKind,
-    RootFilesystemMode, RootLowerInput, RulePermissions, ScheduleCallback, ScheduleDriver,
-    ScheduleEntry, ScheduleHandle, SidecarJsBridgeCall, SidecarJsBridgeCallback, SoftwareInput,
-    SoftwareKind, TimerScheduleDriver, VmGroupConfig, VmUserAccountConfig, VmUserConfig,
-    WasmLimits,
+    node_modules_mount, outbound_body_from_bytes, outbound_body_from_stream, outbound_empty_body,
+    AcpLimits, AgentOsConfig, AgentOsConfigBuilder, AgentOsLimits, AgentOsSidecarConfig, Binding,
+    BindingCallback, BindingLimits, Bindings, FsPermissionRule, FsPermissions, HttpLimits,
+    JsRuntimeLimits, MountConfig, MountPlugin, OutboundBodyError, OutboundCancellation,
+    OutboundHttpLimits, OutboundMiddleware, OutboundMiddlewareError, OutboundRequestBody,
+    OutboundResponseBody, OverlayMountConfig, PackageRef, PatternPermissionRule,
+    PatternPermissions, PermissionMode, Permissions, PluginLimits, PythonLimits, ResourceLimits,
+    RootFilesystemConfig, RootFilesystemKind, RootFilesystemMode, RootLowerInput, RulePermissions,
+    ScheduleCallback, ScheduleDriver, ScheduleEntry, ScheduleHandle, SidecarJsBridgeCall,
+    SidecarJsBridgeCallback, SoftwareInput, SoftwareKind, TimerScheduleDriver, VmGroupConfig,
+    VmUserAccountConfig, VmUserConfig, WasmLimits,
 };
 
 pub use process::{

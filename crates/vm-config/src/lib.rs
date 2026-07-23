@@ -763,6 +763,9 @@ pub struct VmLimitsConfig {
     pub http: Option<HttpLimitsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub outbound_http: Option<OutboundHttpLimitsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub udp: Option<UdpLimitsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -909,6 +912,130 @@ impl VmLimitsConfig {
                     )));
                 }
             }
+        }
+        if let Some(outbound_http) = &self.outbound_http {
+            validate_nonzero_options([
+                (
+                    "limits.outboundHttp.maxExactMiddlewareRoutes",
+                    outbound_http.max_exact_middleware_routes,
+                ),
+                (
+                    "limits.outboundHttp.maxExactMiddlewareKeyBytes",
+                    outbound_http.max_exact_middleware_key_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxExactMiddlewareTotalBytes",
+                    outbound_http.max_exact_middleware_total_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxConnections",
+                    outbound_http.max_connections,
+                ),
+                (
+                    "limits.outboundHttp.maxInFlightMiddlewareInvocations",
+                    outbound_http.max_in_flight_middleware_invocations,
+                ),
+                (
+                    "limits.outboundHttp.maxActiveResponseStreams",
+                    outbound_http.max_active_response_streams,
+                ),
+                (
+                    "limits.outboundHttp.maxClassificationPrefixBytes",
+                    outbound_http.max_classification_prefix_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxRequestTargetBytes",
+                    outbound_http.max_request_target_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxRequestHeaderCount",
+                    outbound_http.max_request_header_count,
+                ),
+                (
+                    "limits.outboundHttp.maxRequestHeaderBytes",
+                    outbound_http.max_request_header_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxRequestBodyBytes",
+                    outbound_http.max_request_body_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxBufferedRequestBytes",
+                    outbound_http.max_buffered_request_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxTotalBufferedRequestBytes",
+                    outbound_http.max_total_buffered_request_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxResponseHeaderCount",
+                    outbound_http.max_response_header_count,
+                ),
+                (
+                    "limits.outboundHttp.maxResponseHeaderBytes",
+                    outbound_http.max_response_header_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxBufferedResponseBytes",
+                    outbound_http.max_buffered_response_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxTotalBufferedResponseBytes",
+                    outbound_http.max_total_buffered_response_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxChunkBytes",
+                    outbound_http.max_chunk_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxClientHelloBytes",
+                    outbound_http.max_client_hello_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxCertificateCacheEntries",
+                    outbound_http.max_certificate_cache_entries,
+                ),
+                (
+                    "limits.outboundHttp.maxCertificateCacheBytes",
+                    outbound_http.max_certificate_cache_bytes,
+                ),
+                (
+                    "limits.outboundHttp.maxPendingCertificateIssuance",
+                    outbound_http.max_pending_certificate_issuance,
+                ),
+                (
+                    "limits.outboundHttp.classificationTimeoutMs",
+                    outbound_http.classification_timeout_ms,
+                ),
+                (
+                    "limits.outboundHttp.tlsHandshakeTimeoutMs",
+                    outbound_http.tls_handshake_timeout_ms,
+                ),
+                (
+                    "limits.outboundHttp.requestReadIdleTimeoutMs",
+                    outbound_http.request_read_idle_timeout_ms,
+                ),
+                (
+                    "limits.outboundHttp.connectionIdleTimeoutMs",
+                    outbound_http.connection_idle_timeout_ms,
+                ),
+                (
+                    "limits.outboundHttp.middlewareQueueTimeoutMs",
+                    outbound_http.middleware_queue_timeout_ms,
+                ),
+                (
+                    "limits.outboundHttp.middlewareResponseTimeoutMs",
+                    outbound_http.middleware_response_timeout_ms,
+                ),
+                (
+                    "limits.outboundHttp.responseIdleTimeoutMs",
+                    outbound_http.response_idle_timeout_ms,
+                ),
+                (
+                    "limits.outboundHttp.downstreamBackpressureTimeoutMs",
+                    outbound_http.downstream_backpressure_timeout_ms,
+                ),
+            ])?;
         }
         if let Some(udp) = &self.udp {
             validate_nonzero_options([
@@ -1154,6 +1281,39 @@ limits_struct!(ReactorLimitsConfig {
 
 limits_struct!(HttpLimitsConfig {
     max_fetch_response_bytes,
+});
+
+limits_struct!(OutboundHttpLimitsConfig {
+    max_exact_middleware_routes,
+    max_exact_middleware_key_bytes,
+    max_exact_middleware_total_bytes,
+    max_connections,
+    max_in_flight_middleware_invocations,
+    max_active_response_streams,
+    max_classification_prefix_bytes,
+    max_request_target_bytes,
+    max_request_header_count,
+    max_request_header_bytes,
+    max_request_body_bytes,
+    max_buffered_request_bytes,
+    max_total_buffered_request_bytes,
+    max_response_header_count,
+    max_response_header_bytes,
+    max_buffered_response_bytes,
+    max_total_buffered_response_bytes,
+    max_chunk_bytes,
+    max_client_hello_bytes,
+    max_certificate_cache_entries,
+    max_certificate_cache_bytes,
+    max_pending_certificate_issuance,
+    classification_timeout_ms,
+    tls_handshake_timeout_ms,
+    request_read_idle_timeout_ms,
+    connection_idle_timeout_ms,
+    middleware_queue_timeout_ms,
+    middleware_response_timeout_ms,
+    response_idle_timeout_ms,
+    downstream_backpressure_timeout_ms,
 });
 
 limits_struct!(UdpLimitsConfig {

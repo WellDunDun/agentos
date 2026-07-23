@@ -49,6 +49,43 @@ Set caps on the `limits` object in the `agentOS` config. Limits are grouped by s
 | `process.maxSpawnFileActions` | File actions decoded for one `posix_spawn` call | Default is `4096`; excess actions fail with `E2BIG`. |
 | `process.maxSpawnFileActionBytes` | Serialized file-action bytes for one `posix_spawn` call | Default is `1 MiB`; excess input fails with `E2BIG`. |
 
+### Outbound HTTP middleware
+
+[Outbound HTTP middleware](/docs/outbound-http-middleware) has a separate `limits.outboundHttp` group. The current guest-JavaScript path enforces route shape, request target/header/body bounds, response header/body bounds, and the middleware response deadline. Fields for connection classification, incremental stream credit, and certificate issuance are already validated in shared VM configuration but become active only when those lower-level transports land; do not rely on those reserved fields as enforcement controls yet.
+
+| Limit | Default |
+|---|---:|
+| `outboundHttp.maxExactMiddlewareRoutes` | 128 |
+| `outboundHttp.maxExactMiddlewareKeyBytes` | 255 bytes |
+| `outboundHttp.maxExactMiddlewareTotalBytes` | 32 KiB |
+| `outboundHttp.maxConnections` | 128 |
+| `outboundHttp.maxInFlightMiddlewareInvocations` | 32 |
+| `outboundHttp.maxActiveResponseStreams` | 128 |
+| `outboundHttp.maxClassificationPrefixBytes` | 64 KiB |
+| `outboundHttp.maxRequestTargetBytes` | 16 KiB |
+| `outboundHttp.maxRequestHeaderCount` | 128 |
+| `outboundHttp.maxRequestHeaderBytes` | 64 KiB |
+| `outboundHttp.maxRequestBodyBytes` | 16 MiB |
+| `outboundHttp.maxBufferedRequestBytes` | 1 MiB |
+| `outboundHttp.maxTotalBufferedRequestBytes` | 16 MiB |
+| `outboundHttp.maxResponseHeaderCount` | 128 |
+| `outboundHttp.maxResponseHeaderBytes` | 64 KiB |
+| `outboundHttp.maxBufferedResponseBytes` | 1 MiB |
+| `outboundHttp.maxTotalBufferedResponseBytes` | 16 MiB |
+| `outboundHttp.maxChunkBytes` | 64 KiB |
+| `outboundHttp.maxClientHelloBytes` | 64 KiB |
+| `outboundHttp.maxCertificateCacheEntries` | 256 |
+| `outboundHttp.maxCertificateCacheBytes` | 8 MiB |
+| `outboundHttp.maxPendingCertificateIssuance` | 8 |
+| `outboundHttp.classificationTimeoutMs` | 10,000 ms |
+| `outboundHttp.tlsHandshakeTimeoutMs` | 10,000 ms |
+| `outboundHttp.requestReadIdleTimeoutMs` | 30,000 ms |
+| `outboundHttp.connectionIdleTimeoutMs` | 60,000 ms |
+| `outboundHttp.middlewareQueueTimeoutMs` | 5,000 ms |
+| `outboundHttp.middlewareResponseTimeoutMs` | 300,000 ms |
+| `outboundHttp.responseIdleTimeoutMs` | 300,000 ms |
+| `outboundHttp.downstreamBackpressureTimeoutMs` | 300,000 ms |
+
 ## Behavior at the limit
 
 - **WASM stack**: deep recursion throws a stack-overflow error in the guest, never a host crash.

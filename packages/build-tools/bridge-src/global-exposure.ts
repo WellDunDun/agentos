@@ -1170,6 +1170,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
 		rationale: "Host net socket connect bridge reference.",
 	},
 	{
+		name: "_outboundHttpRequestRaw",
+		classification: "hardened",
+		rationale: "Host outbound HTTP middleware bridge reference.",
+	},
+	{
 		name: "_netSocketPollRaw",
 		classification: "hardened",
 		rationale: "Host net socket poll bridge reference.",

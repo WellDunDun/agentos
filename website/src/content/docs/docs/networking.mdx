@@ -6,6 +6,10 @@ skill: true
 
 Proxy buffered HTTP requests into VM services with `httpRequest` and create time-limited, actor-only preview URLs (with configurable expiration, revocation, and CORS), all carried over one transport (the kernel socket table) that is loopback-only by default under a three-layer confinement model.
 
+## Outbound HTTP middleware
+
+`httpRequest` and previews carry host requests **into** a VM service. Outbound HTTP middleware handles guest `fetch`, `node:http`, and `node:https` requests going **out** of the VM, before an upstream socket is opened. Trusted host code can forward, mutate, mock, or route those requests with the standard Fetch `Request` and `Response` types. See [Outbound HTTP Middleware](/docs/outbound-http-middleware).
+
 ## Run an HTTP server in the VM
 
 Guest code runs a normal Node HTTP server: it binds a loopback port inside the VM exactly like any Node process. Write the server file and spawn it.

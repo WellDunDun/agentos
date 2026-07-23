@@ -501,6 +501,187 @@ interface AgentOsVmAdmin extends InProcessSidecarVmAdmin {
 	snapshotRootFilesystem?: (maxBytes: number) => Promise<RootSnapshotExport>;
 	bindings: Bindings[];
 	bindingReference: string;
+	outboundMiddlewareByCallbackKey: ReadonlyMap<string, OutboundMiddleware>;
+	outboundHttpBufferedResponseLimitBytes: number;
+}
+
+const OUTBOUND_HTTP_MIDDLEWARE_COLLECTION =
+	"__agentos_outbound_http_middleware";
+const OUTBOUND_HTTP_CATCH_ALL_KEY = "*";
+const OUTBOUND_HTTP_CALLBACK_PREFIX = `${OUTBOUND_HTTP_MIDDLEWARE_COLLECTION}:`;
+const OUTBOUND_HTTP_CALLBACK_TIMEOUT_MS = 300_000;
+const DEFAULT_OUTBOUND_HTTP_BUFFERED_RESPONSE_LIMIT_BYTES = 1024 * 1024;
+
+type SidecarRequestHandler = NonNullable<
+	Parameters<SidecarProcess["setSidecarRequestHandler"]>[0]
+>;
+
+interface SharedSidecarRequestRouter {
+	handlersByVmId: Map<string, SidecarRequestHandler>;
+}
+
+const sharedSidecarRequestRouters = new WeakMap<
+	SidecarProcess,
+	SharedSidecarRequestRouter
+>();
+
+function registerVmSidecarRequestHandler(
+	client: SidecarProcess,
+	vmId: string,
+	handler: SidecarRequestHandler,
+): () => void {
+	let router = sharedSidecarRequestRouters.get(client);
+	if (!router) {
+		router = { handlersByVmId: new Map() };
+		sharedSidecarRequestRouters.set(client, router);
+		client.setSidecarRequestHandler((request) => {
+			if (request.ownership.scope !== "vm") {
+				throw new Error(
+					`ERR_AGENTOS_SIDECAR_REQUEST_SCOPE: expected VM ownership, received ${request.ownership.scope}`,
+				);
+			}
+			const vmHandler = router?.handlersByVmId.get(request.ownership.vm_id);
+			if (!vmHandler) {
+				throw new Error(
+					`ERR_AGENTOS_SIDECAR_REQUEST_VM_UNAVAILABLE: no host request handler for VM ${request.ownership.vm_id}`,
+				);
+			}
+			return vmHandler(request);
+		});
+	}
+	if (router.handlersByVmId.has(vmId)) {
+		throw new Error(
+			`ERR_AGENTOS_SIDECAR_REQUEST_VM_DUPLICATE: host request handler already registered for VM ${vmId}`,
+		);
+	}
+	router.handlersByVmId.set(vmId, handler);
+	return () => {
+		const current = sharedSidecarRequestRouters.get(client);
+		if (!current) {
+			return;
+		}
+		current.handlersByVmId.delete(vmId);
+		if (current.handlersByVmId.size === 0) {
+			client.setSidecarRequestHandler(null);
+			sharedSidecarRequestRouters.delete(client);
+		}
+	};
+}
+
+interface OutboundHttpCallbackInput {
+	type: "outbound_http";
+	method: string;
+	url: string;
+	headers: Array<[string, string]>;
+	bodyBase64?: string;
+}
+
+interface OutboundHttpCallbackResult {
+	status: number;
+	statusText: string;
+	headers: Array<[string, string]>;
+	bodyBase64: string;
+}
+
+async function readBoundedOutboundResponseBody(
+	response: Response,
+	maxBytes: number,
+): Promise<Uint8Array> {
+	if (!response.body) {
+		return new Uint8Array();
+	}
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let totalBytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) {
+				break;
+			}
+			if (value.byteLength === 0) {
+				continue;
+			}
+			totalBytes += value.byteLength;
+			if (totalBytes > maxBytes) {
+				throw new Error(
+					`limits.outboundHttp.maxBufferedResponseBytes exceeded ${maxBytes}; raise limits.outboundHttp.maxBufferedResponseBytes`,
+				);
+			}
+			chunks.push(value);
+		}
+	} catch (error) {
+		await reader.cancel(error).catch((cancelError) => {
+			console.error(
+				"ERR_AGENTOS_OUTBOUND_MIDDLEWARE_BODY_CANCEL_FAILED",
+				cancelError,
+			);
+		});
+		throw error;
+	}
+	const body = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return body;
+}
+
+function buildOutboundMiddlewareCallbackMap(
+	options: Pick<AgentOsOptions, "outbound" | "outboundByHost">,
+): Map<string, OutboundMiddleware> {
+	const callbacks = new Map<string, OutboundMiddleware>();
+	if (options.outbound) {
+		callbacks.set(
+			`${OUTBOUND_HTTP_CALLBACK_PREFIX}${OUTBOUND_HTTP_CATCH_ALL_KEY}`,
+			options.outbound,
+		);
+	}
+	for (const rawHost of Object.keys(options.outboundByHost ?? {})) {
+		const middleware = options.outboundByHost?.[rawHost];
+		if (typeof middleware !== "function") {
+			throw new TypeError(
+				`outboundByHost[${JSON.stringify(rawHost)}] must be a function`,
+			);
+		}
+		callbacks.set(`${OUTBOUND_HTTP_CALLBACK_PREFIX}${rawHost}`, middleware);
+	}
+	return callbacks;
+}
+
+async function registerOutboundMiddlewareOnSidecar(
+	client: SidecarProcess,
+	session: AuthenticatedSession,
+	vm: CreatedVm,
+	callbacks: ReadonlyMap<string, OutboundMiddleware>,
+): Promise<void> {
+	if (callbacks.size === 0) {
+		return;
+	}
+	const definitions: Record<string, SidecarRegisteredHostCallbackDefinition> =
+		Object.create(null) as Record<
+			string,
+			SidecarRegisteredHostCallbackDefinition
+		>;
+	for (const callbackKey of callbacks.keys()) {
+		const routeKey = callbackKey.slice(OUTBOUND_HTTP_CALLBACK_PREFIX.length);
+		definitions[routeKey] = {
+			description: "agentOS outbound HTTP middleware capability",
+			inputSchema: {
+				type: "object",
+				additionalProperties: false,
+			},
+			timeoutMs: OUTBOUND_HTTP_CALLBACK_TIMEOUT_MS,
+		};
+	}
+	await client.registerHostCallbacks(session, vm, {
+		name: OUTBOUND_HTTP_MIDDLEWARE_COLLECTION,
+		description: "agentOS outbound HTTP middleware",
+		commandAliases: [],
+		registryCommandAliases: [],
+		callbacks: definitions,
+	});
 }
 
 interface AcpTerminalEntry {
@@ -626,6 +807,39 @@ export interface AgentOsLimits {
 		/** Cap on `vm.httpRequest()` buffered response bodies. Must be <= the sidecar wire frame cap. */
 		maxFetchResponseBytes?: number;
 	};
+	/** Outbound HTTP middleware routing, buffering, TLS, and deadline limits. */
+	outboundHttp?: {
+		maxExactMiddlewareRoutes?: number;
+		maxExactMiddlewareKeyBytes?: number;
+		maxExactMiddlewareTotalBytes?: number;
+		maxConnections?: number;
+		maxInFlightMiddlewareInvocations?: number;
+		maxActiveResponseStreams?: number;
+		maxClassificationPrefixBytes?: number;
+		maxRequestTargetBytes?: number;
+		maxRequestHeaderCount?: number;
+		maxRequestHeaderBytes?: number;
+		maxRequestBodyBytes?: number;
+		maxBufferedRequestBytes?: number;
+		maxTotalBufferedRequestBytes?: number;
+		maxResponseHeaderCount?: number;
+		maxResponseHeaderBytes?: number;
+		maxBufferedResponseBytes?: number;
+		maxTotalBufferedResponseBytes?: number;
+		maxChunkBytes?: number;
+		maxClientHelloBytes?: number;
+		maxCertificateCacheEntries?: number;
+		maxCertificateCacheBytes?: number;
+		maxPendingCertificateIssuance?: number;
+		classificationTimeoutMs?: number;
+		tlsHandshakeTimeoutMs?: number;
+		requestReadIdleTimeoutMs?: number;
+		connectionIdleTimeoutMs?: number;
+		middlewareQueueTimeoutMs?: number;
+		middlewareResponseTimeoutMs?: number;
+		responseIdleTimeoutMs?: number;
+		downstreamBackpressureTimeoutMs?: number;
+	};
 	/** Host binding registration and invocation limits. */
 	bindings?: {
 		defaultBindingTimeoutMs?: number;
@@ -697,6 +911,16 @@ export interface AgentOsLimits {
 		pendingEventBytes?: number;
 	};
 }
+
+/**
+ * Trusted host middleware for one eligible outbound HTTP request.
+ *
+ * Call `fetch(request)` to forward through host networking, return another
+ * response to short-circuit the request, or throw to fail it.
+ */
+export type OutboundMiddleware = (
+	request: Request,
+) => Response | Promise<Response>;
 
 export interface AgentStderrEvent {
 	sessionId: string;
@@ -818,6 +1042,16 @@ export interface AgentOsOptions {
 	scheduleDriver?: ScheduleDriver;
 	/** Host-side bindings available to agents inside the VM. */
 	bindings?: Bindings[];
+	/**
+	 * Handles eligible outbound HTTP requests that do not match
+	 * {@link outboundByHost}.
+	 */
+	outbound?: OutboundMiddleware;
+	/**
+	 * Handles eligible outbound HTTP requests for exact hostnames or IP
+	 * literals. Exact-host middleware takes precedence over {@link outbound}.
+	 */
+	outboundByHost?: Readonly<Record<string, OutboundMiddleware>>;
 	/**
 	 * Custom permission policy for the kernel. Controls access to filesystem,
 	 * network, child process, and environment operations. Defaults to allowAll.
@@ -1893,6 +2127,10 @@ async function handleHostCallback(
 		};
 	}
 
+	if (payload.callback_key.startsWith(OUTBOUND_HTTP_CALLBACK_PREFIX)) {
+		return handleOutboundHttpCallback(payload, context);
+	}
+
 	const command = parseHostCommandCallbackInput(payload.input);
 	if (command) {
 		try {
@@ -1959,6 +2197,111 @@ async function handleHostCallback(
 	}
 }
 
+async function handleOutboundHttpCallback(
+	payload: Extract<SidecarRequestFrame["payload"], { type: "host_callback" }>,
+	context: HostCallbackContext,
+): Promise<SidecarResponsePayload> {
+	const middleware = context.outboundMiddlewareByCallbackKey.get(
+		payload.callback_key,
+	);
+	if (!middleware) {
+		return {
+			type: "host_callback_result",
+			invocation_id: payload.invocation_id,
+			error: "ERR_AGENTOS_OUTBOUND_MIDDLEWARE_UNAVAILABLE",
+		};
+	}
+	const input = payload.input as Partial<OutboundHttpCallbackInput>;
+	if (
+		input.type !== "outbound_http" ||
+		typeof input.method !== "string" ||
+		typeof input.url !== "string" ||
+		!Array.isArray(input.headers) ||
+		!input.headers.every(
+			(entry): entry is [string, string] =>
+				Array.isArray(entry) &&
+				entry.length === 2 &&
+				typeof entry[0] === "string" &&
+				typeof entry[1] === "string",
+		)
+	) {
+		return {
+			type: "host_callback_result",
+			invocation_id: payload.invocation_id,
+			error: "ERR_AGENTOS_OUTBOUND_MIDDLEWARE_INVALID_REQUEST",
+		};
+	}
+
+	const method = input.method.toUpperCase();
+	const body =
+		typeof input.bodyBase64 === "string"
+			? new Uint8Array(Buffer.from(input.bodyBase64, "base64"))
+			: undefined;
+	const controller = new AbortController();
+	const timeout = setTimeout(
+		() =>
+			controller.abort(
+				new Error(
+					`Outbound HTTP middleware timed out after ${payload.timeout_ms}ms`,
+				),
+			),
+		Math.max(1, payload.timeout_ms),
+	);
+	try {
+		const init: RequestInit & { duplex?: "half" } = {
+			method,
+			headers: input.headers,
+			signal: controller.signal,
+		};
+		if (body && body.byteLength > 0 && method !== "GET" && method !== "HEAD") {
+			init.body = body;
+			init.duplex = "half";
+		}
+		const response = await middleware(new Request(input.url, init));
+		if (!(response instanceof Response)) {
+			throw new TypeError("Outbound middleware must return a Response");
+		}
+		const suppressBody =
+			method === "HEAD" ||
+			response.status === 204 ||
+			response.status === 205 ||
+			response.status === 304;
+		let responseBody: Uint8Array = new Uint8Array();
+		if (suppressBody) {
+			await response.body?.cancel().catch((cancelError) => {
+				console.error(
+					"ERR_AGENTOS_OUTBOUND_MIDDLEWARE_BODY_CANCEL_FAILED",
+					cancelError,
+				);
+			});
+		} else {
+			responseBody = await readBoundedOutboundResponseBody(
+				response,
+				context.outboundHttpBufferedResponseLimitBytes,
+			);
+		}
+		const result: OutboundHttpCallbackResult = {
+			status: response.status,
+			statusText: response.statusText,
+			headers: Array.from(response.headers.entries()),
+			bodyBase64: Buffer.from(responseBody).toString("base64"),
+		};
+		return {
+			type: "host_callback_result",
+			invocation_id: payload.invocation_id,
+			result,
+		};
+	} catch (error) {
+		return {
+			type: "host_callback_result",
+			invocation_id: payload.invocation_id,
+			error: bridgeErrorMessage(error),
+		};
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
 function buildBindingMap(bindings: Bindings[]): Map<string, Binding> {
 	const bindingMap = new Map<string, Binding>();
 	for (const bindingCollection of bindings) {
@@ -1981,6 +2324,8 @@ interface HostCommandCallbackInput {
 interface HostCallbackContext {
 	bindings: Bindings[];
 	bindingMap: ReadonlyMap<string, Binding>;
+	outboundMiddlewareByCallbackKey: ReadonlyMap<string, OutboundMiddleware>;
+	outboundHttpBufferedResponseLimitBytes: number;
 	permissions: Permissions;
 	readFile(path: string): Promise<Uint8Array>;
 }
@@ -2644,6 +2989,11 @@ export class AgentOs {
 	private readonly _agentStderrHandler?: AgentStderrHandler;
 	private readonly _agentExitHandler?: AgentExitHandler;
 	private readonly _limitWarningHandler?: LimitWarningHandler;
+	private readonly _outboundMiddlewareByCallbackKey: ReadonlyMap<
+		string,
+		OutboundMiddleware
+	>;
+	private readonly _outboundHttpBufferedResponseLimitBytes: number;
 	private readonly _disposeHooks: Array<() => void | Promise<void>> = [];
 
 	private constructor(
@@ -2659,6 +3009,12 @@ export class AgentOs {
 		agentStderrHandler?: AgentStderrHandler,
 		agentExitHandler?: AgentExitHandler,
 		limitWarningHandler?: LimitWarningHandler,
+		outboundMiddlewareByCallbackKey: ReadonlyMap<
+			string,
+			OutboundMiddleware
+		> = new Map(),
+		outboundHttpBufferedResponseLimitBytes =
+			DEFAULT_OUTBOUND_HTTP_BUFFERED_RESPONSE_LIMIT_BYTES,
 	) {
 		this.#kernel = kernel;
 		this.sidecar = sidecar;
@@ -2672,6 +3028,10 @@ export class AgentOs {
 		this._agentStderrHandler = agentStderrHandler;
 		this._agentExitHandler = agentExitHandler;
 		this._limitWarningHandler = limitWarningHandler;
+		this._outboundMiddlewareByCallbackKey =
+			outboundMiddlewareByCallbackKey;
+		this._outboundHttpBufferedResponseLimitBytes =
+			outboundHttpBufferedResponseLimitBytes;
 		this._disposeSidecarEventListener = this._sidecarClient.onEvent((event) => {
 			this._handleSidecarEvent(event);
 		});
@@ -2743,6 +3103,11 @@ export class AgentOs {
 		options = await resolveSandboxOptions(options);
 		const sandboxDisposeHooks = getSandboxDisposeHooks(options);
 		const bindings = options.bindings;
+		const outboundMiddlewareByCallbackKey =
+			buildOutboundMiddlewareCallbackMap(options);
+		const outboundHttpBufferedResponseLimitBytes =
+			options.limits?.outboundHttp?.maxBufferedResponseBytes ??
+			DEFAULT_OUTBOUND_HTTP_BUFFERED_RESPONSE_LIMIT_BYTES;
 
 		const createVmAdmin = async (): Promise<AgentOsVmAdmin> => {
 			// The `/opt/agentos` projection is built by the sidecar from the
@@ -2883,6 +3248,12 @@ export class AgentOs {
 						);
 					}
 				}
+				await registerOutboundMiddlewareOnSidecar(
+					client,
+					session,
+					nativeVm,
+					outboundMiddlewareByCallbackKey,
+				);
 
 				rootBridge = new NativeSidecarKernelProxy({
 					client,
@@ -2944,6 +3315,8 @@ export class AgentOs {
 						),
 					bindings: bindings ?? [],
 					bindingReference,
+					outboundMiddlewareByCallbackKey,
+					outboundHttpBufferedResponseLimitBytes,
 					async dispose() {
 						if (kernel) {
 							const currentKernel = kernel;
@@ -3000,6 +3373,8 @@ export class AgentOs {
 				options?.onAgentStderr ?? defaultAgentStderrHandler,
 				options?.onAgentExit ?? defaultAgentExitHandler,
 				options?.onLimitWarning,
+				vmAdmin.outboundMiddlewareByCallbackKey,
+				vmAdmin.outboundHttpBufferedResponseLimitBytes,
 			);
 			vm._sidecarLease = sidecarLease;
 			vm._bindings = vmAdmin.bindings;
@@ -4150,10 +4525,17 @@ export class AgentOs {
 		const context: HostCallbackContext = {
 			bindings: this._bindings,
 			bindingMap: buildBindingMap(this._bindings),
+			outboundMiddlewareByCallbackKey:
+				this._outboundMiddlewareByCallbackKey,
+			outboundHttpBufferedResponseLimitBytes:
+				this._outboundHttpBufferedResponseLimitBytes,
 			permissions: this._permissions,
 			readFile: (path) => this.readFile(path),
 		};
-		this._sidecarClient.setSidecarRequestHandler((request) => {
+		const unregister = registerVmSidecarRequestHandler(
+			this._sidecarClient,
+			this._sidecarVm.vmId,
+			(request) => {
 			switch (request.payload.type) {
 				case "host_callback":
 					return handleHostCallback(request, context);
@@ -4164,7 +4546,9 @@ export class AgentOs {
 				case "ext":
 					return this._handleAcpExtSidecarRequest(request.payload.envelope);
 			}
-		});
+			},
+		);
+		this._disposeHooks.push(unregister);
 	}
 
 	private async _handleAcpExtSidecarRequest(envelope: {

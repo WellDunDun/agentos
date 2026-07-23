@@ -306,6 +306,7 @@
 				"_netBindUnixRaw",
 				"_netBindConnectedUnixRaw",
 				"_netSocketConnectRaw",
+				"_outboundHttpRequestRaw",
 				"_netSocketPollRaw",
 				"_netSocketReadRaw",
 				"_netSocketSetReadInterestRaw",
@@ -1039,6 +1040,10 @@
 		},
 		"_netSocketConnectRaw": {
 			"method": "net.connect",
+			"translateArgs": false
+		},
+		"_outboundHttpRequestRaw": {
+			"method": "http.outbound_request",
 			"translateArgs": false
 		},
 		"_netSocketDestroyRaw": {

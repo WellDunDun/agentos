@@ -15,7 +15,8 @@ pub(crate) use crate::execution::{
     parse_signal, record_execute_exit_event_queue_wait, record_execute_phase,
     sanitize_javascript_child_process_internal_bootstrap_env,
     service_javascript_kernel_fd_write_sync_rpc, service_javascript_sync_rpc,
-    JavascriptSyncRpcServiceRequest, LoopbackHttpDispatchRequest,
+    JavascriptSyncRpcServiceRequest, LoopbackHttpDispatchRequest, OutboundHttpRuntimeContext,
+    OutboundHttpRuntimeLimits,
 };
 use crate::extension::{
     Extension, ExtensionBufferedProcessOutput, ExtensionContext, ExtensionFuture, ExtensionHost,
@@ -2720,6 +2721,20 @@ where
                     let socket_paths = build_javascript_socket_path_context(vm)?;
                     let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
                     let capabilities = vm.capabilities.clone();
+                    let outbound_http = Some(OutboundHttpRuntimeContext {
+                        ownership: OwnershipScope::vm(
+                            vm.connection_id.clone(),
+                            vm.session_id.clone(),
+                            vm_id.to_owned(),
+                        ),
+                        sidecar_requests: self.sidecar_requests.clone(),
+                        registration: vm
+                            .bindings
+                            .get(crate::bindings::OUTBOUND_HTTP_MIDDLEWARE_COLLECTION)
+                            .cloned()
+                            .map(Arc::new),
+                        limits: OutboundHttpRuntimeLimits::from_vm_limits(&vm.limits),
+                    });
                     let Some(process) = vm.active_processes.get_mut(process_id) else {
                         log_stale_process_event(
                             &self.bridge,
@@ -2739,6 +2754,7 @@ where
                         process,
                         sync_request: &request,
                         capabilities,
+                        outbound_http,
                     })
                     .await
                 }
