@@ -363,11 +363,14 @@ async function resolveEsmImport(specifier, importer) {
 		specifier.startsWith("../") ||
 		specifier.startsWith("/")
 	) {
-		return resolveModuleFile(
-			specifier.startsWith("/")
-				? specifier
-				: resolve(dirname(importer), specifier),
-		);
+		const candidate = specifier.startsWith("/")
+			? specifier
+			: resolve(dirname(importer), specifier);
+		return resolveModuleFile(candidate, {
+			substituteTypeScriptSource:
+				(specifier.startsWith("./") || specifier.startsWith("../")) &&
+				extname(candidate).toLowerCase() === ".js",
+		});
 	}
 	if (specifier.startsWith("#")) {
 		return resolvePackageImport(specifier, importer);
@@ -529,9 +532,20 @@ function selectConditionalExport(value) {
 	return undefined;
 }
 
-async function resolveModuleFile(candidate) {
+async function resolveModuleFile(
+	candidate,
+	{ substituteTypeScriptSource = false } = {},
+) {
 	const candidates = extname(candidate)
-		? [candidate]
+		? [
+				candidate,
+				...(substituteTypeScriptSource
+					? [
+							`${candidate.slice(0, -extname(candidate).length)}.ts`,
+							`${candidate.slice(0, -extname(candidate).length)}.tsx`,
+						]
+					: []),
+			]
 		: [
 				candidate,
 				`${candidate}.mjs`,

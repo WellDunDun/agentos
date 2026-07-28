@@ -22,6 +22,69 @@ const builder = join(packageRoot, "cli", "apps-builder.mjs");
 const rivetKitTarball = process.env.AGENTOS_APPS_RIVETKIT_TARBALL;
 
 describe("apps-builder", () => {
+	test("resolves NodeNext .js specifiers to sibling TypeScript sources", async () => {
+		const root = await mkdtemp(join(tmpdir(), "agentos-apps-builder-nodenext-"));
+		const workspace = join(root, "workspace");
+		const release = join(root, "release");
+		await mkdir(join(workspace, "src"), { recursive: true });
+		await writeFile(
+			join(workspace, "entry.ts"),
+			[
+				'import { typed } from "./src/typed.js";',
+				'import { component } from "./src/component.js";',
+				'import { selected } from "./src/existing.js";',
+				"export default { typed, component, selected };",
+			].join("\n"),
+		);
+		await writeFile(
+			join(workspace, "src", "typed.ts"),
+			'export const typed: string = "ts";\n',
+		);
+		await writeFile(
+			join(workspace, "src", "component.tsx"),
+			'export const component: string = "tsx";\n',
+		);
+		await writeFile(
+			join(workspace, "src", "existing.js"),
+			'export const selected = "js";\n',
+		);
+		await writeFile(
+			join(workspace, "src", "existing.ts"),
+			'export const selected: string = "ts";\n',
+		);
+		const configPath = join(root, "config.json");
+		await writeFile(
+			configPath,
+			JSON.stringify({
+				workspace,
+				release,
+				entrypoint: "entry.ts",
+				version: "nodenext-test",
+				sourceFiles: [
+					"src/typed.ts",
+					"src/component.tsx",
+					"src/existing.js",
+					"src/existing.ts",
+				],
+				usesRivetKit: false,
+				maxOutputBytes: 1024 * 1024,
+				maxOutputFiles: 32,
+				maxFileBytes: 512 * 1024,
+			}),
+		);
+
+		await execFileAsync(process.execPath, [builder, configPath]);
+
+		const loaded = await import(
+			`${pathToFileURL(join(release, "main.mjs")).href}?test=${Date.now()}`
+		);
+		expect(loaded.default).toEqual({
+			typed: "ts",
+			component: "tsx",
+			selected: "js",
+		});
+	});
+
 	test("emits a minimal executable TypeScript release with static assets", async () => {
 		const root = await mkdtemp(join(tmpdir(), "agentos-apps-builder-"));
 		const workspace = join(root, "workspace");
