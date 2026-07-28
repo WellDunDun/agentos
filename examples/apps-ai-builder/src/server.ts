@@ -80,6 +80,7 @@ async function generateApp(appId: string, prompt: string) {
 			return await deployApp({
 				appId,
 				files,
+				warmTimeoutMs: 120_000,
 			});
 		} catch (error) {
 			const appsError =
@@ -89,7 +90,12 @@ async function generateApp(appId: string, prompt: string) {
 					"code" in error &&
 					typeof error.code === "string" &&
 					error.code.startsWith("agentos_apps_"));
-			if (!appsError || attempt === maxRepairs) {
+			const serverFault =
+				typeof error === "object" &&
+				error !== null &&
+				"serverFault" in error &&
+				error.serverFault === true;
+			if (!appsError || serverFault || attempt === maxRepairs) {
 				throw error;
 			}
 			const details = error as {
