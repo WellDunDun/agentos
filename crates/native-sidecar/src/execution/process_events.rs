@@ -945,24 +945,13 @@ where
         let Some(process) = vm.active_processes.get_mut(process_id) else {
             return Ok(());
         };
-        let connected = process
-            .pending_javascript_net_connects
-            .remove(&completion.request_id);
-        let completion_result = match (completion.result, connected) {
-            (Ok(_), Some(connected)) => {
-                finalize_javascript_net_connect(process, &kernel_readiness, connected).map_err(
-                    |error| crate::state::DeferredRpcError {
-                        code: javascript_sync_rpc_error_code(&error),
-                        message: javascript_sync_rpc_error_message(&error),
-                    },
-                )
-            }
-            (result @ Err(_), Some(connected)) => {
-                restore_pending_bound_unix_connect(process, &connected)?;
-                result
-            }
-            (result, None) => result,
-        };
+        let completion_result = settle_javascript_sync_rpc_completion(
+            process,
+            &kernel_readiness,
+            completion.request_id,
+            &completion.method,
+            completion.result,
+        )?;
         let result = match completion_result {
             Ok(value) => process
                 .execution

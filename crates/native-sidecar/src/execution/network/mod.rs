@@ -1,8 +1,9 @@
 mod tcp;
+#[cfg(test)]
+pub(crate) use self::tcp::finalize_javascript_net_connect;
 pub(in crate::execution) use self::tcp::*;
 pub(crate) use self::tcp::{
-    build_javascript_socket_path_context, finalize_javascript_net_connect,
-    restore_pending_bound_unix_connect,
+    build_javascript_socket_path_context, settle_javascript_sync_rpc_completion,
 };
 mod unix;
 pub(in crate::execution) use self::unix::*;

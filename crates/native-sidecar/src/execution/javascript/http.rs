@@ -538,7 +538,8 @@ where
                 capabilities: capabilities.clone(),
             })
             .await;
-            settle_nested_javascript_sync_rpc(process, &request, response).await?;
+            settle_nested_javascript_sync_rpc(process, kernel_readiness, &request, response)
+                .await?;
         }
         ActiveExecutionEvent::Exited(code) => {
             return Err(SidecarError::Execution(format!(
@@ -554,6 +555,7 @@ where
 
 async fn settle_nested_javascript_sync_rpc(
     process: &mut ActiveProcess,
+    kernel_readiness: &KernelSocketReadinessRegistry,
     request: &JavascriptSyncRpcRequest,
     response: Result<JavascriptSyncRpcServiceResponse, SidecarError>,
 ) -> Result<(), SidecarError> {
@@ -586,6 +588,13 @@ async fn settle_nested_javascript_sync_rpc(
                 },
                 None => receive.await,
             };
+            let result = settle_javascript_sync_rpc_completion(
+                process,
+                kernel_readiness,
+                request.id,
+                &request.method,
+                result,
+            )?;
             match result {
                 Ok(value) => Ok(JavascriptSyncRpcServiceResponse::Json(value)),
                 Err(error) => {
@@ -1471,7 +1480,8 @@ where
                     capabilities: capabilities.clone(),
                 })
                 .await;
-                settle_nested_javascript_sync_rpc(process, &request, response).await?;
+                settle_nested_javascript_sync_rpc(process, &kernel_readiness, &request, response)
+                    .await?;
             }
             ActiveExecutionEvent::Exited(code) => {
                 process.pending_http_requests.remove(&request_key);

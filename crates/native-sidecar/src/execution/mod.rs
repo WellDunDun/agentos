@@ -45,14 +45,14 @@ pub(crate) use self::stdio::{
     write_kernel_process_stdin,
 };
 mod network;
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use self::network::reserve_udp_receive_buffer;
 use self::network::*;
 pub(crate) use self::network::{
-    build_javascript_socket_path_context, finalize_javascript_net_connect, format_dns_resource,
-    reserve_tls_write_payload,
+    build_javascript_socket_path_context, format_dns_resource, reserve_tls_write_payload,
+    settle_javascript_sync_rpc_completion,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use self::network::{finalize_javascript_net_connect, reserve_udp_receive_buffer};
 mod javascript;
 use self::javascript::*;
 #[cfg(test)]

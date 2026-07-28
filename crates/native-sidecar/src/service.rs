@@ -2802,7 +2802,11 @@ where
                             vm_id: envelope_vm_id,
                             process_id: envelope_process_id,
                             event: ActiveExecutionEvent::JavascriptSyncRpcCompletion(
-                                crate::state::JavascriptSyncRpcCompletion { request_id, result },
+                                crate::state::JavascriptSyncRpcCompletion {
+                                    request_id,
+                                    method,
+                                    result,
+                                },
                             ),
                         })
                         .await

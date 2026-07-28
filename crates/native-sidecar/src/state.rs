@@ -2650,6 +2650,7 @@ pub(crate) enum ActiveExecutionEvent {
 #[derive(Debug)]
 pub(crate) struct JavascriptSyncRpcCompletion {
     pub(crate) request_id: u64,
+    pub(crate) method: String,
     pub(crate) result: Result<Value, DeferredRpcError>,
 }
 

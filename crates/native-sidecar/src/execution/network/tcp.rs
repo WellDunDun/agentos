@@ -2119,6 +2119,53 @@ pub(crate) fn finalize_javascript_net_connect(
     }
 }
 
+pub(crate) fn settle_javascript_sync_rpc_completion(
+    process: &mut ActiveProcess,
+    kernel_readiness: &KernelSocketReadinessRegistry,
+    request_id: u64,
+    method: &str,
+    result: Result<Value, crate::state::DeferredRpcError>,
+) -> Result<Result<Value, crate::state::DeferredRpcError>, SidecarError> {
+    let connected = process.pending_javascript_net_connects.remove(&request_id);
+    match (method, result, connected) {
+        ("net.connect", Ok(_), Some(connected)) => Ok(finalize_javascript_net_connect(
+            process,
+            kernel_readiness,
+            connected,
+        )
+        .map_err(|error| crate::state::DeferredRpcError {
+            code: javascript_sync_rpc_error_code(&error),
+            message: javascript_sync_rpc_error_message(&error),
+        })),
+        ("net.connect", result @ Err(_), Some(connected)) => {
+            restore_pending_bound_unix_connect(process, &connected)?;
+            Ok(result)
+        }
+        ("net.connect", _, None) => {
+            let message = format!(
+                "ERR_AGENTOS_SOCKET_CONNECT_STATE: net.connect request {request_id} completed without its pending socket state"
+            );
+            eprintln!("{message}");
+            Ok(Err(crate::state::DeferredRpcError {
+                code: String::from("EIO"),
+                message,
+            }))
+        }
+        (_, result, None) => Ok(result),
+        (_, _, Some(connected)) => {
+            restore_pending_bound_unix_connect(process, &connected)?;
+            let message = format!(
+                "ERR_AGENTOS_SOCKET_CONNECT_STATE: pending net.connect request {request_id} was routed to deferred method {method}"
+            );
+            eprintln!("{message}");
+            Ok(Err(crate::state::DeferredRpcError {
+                code: String::from("EIO"),
+                message,
+            }))
+        }
+    }
+}
+
 pub(crate) fn restore_pending_bound_unix_connect(
     process: &mut ActiveProcess,
     pending: &Arc<Mutex<PendingJavascriptNetConnectState>>,

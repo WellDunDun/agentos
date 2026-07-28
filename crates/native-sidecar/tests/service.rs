@@ -88,8 +88,9 @@ mod service {
             clamp_javascript_net_poll_wait, finalize_javascript_net_connect, format_dns_resource,
             format_tcp_resource, runtime_child_is_alive,
             service_javascript_net_sync_rpc as service_javascript_net_sync_rpc_inner,
-            signal_runtime_process, JavascriptNetSyncRpcServiceRequest,
-            JavascriptSyncRpcServiceRequest, JavascriptSyncRpcServiceResponse,
+            settle_javascript_sync_rpc_completion, signal_runtime_process,
+            JavascriptNetSyncRpcServiceRequest, JavascriptSyncRpcServiceRequest,
+            JavascriptSyncRpcServiceResponse,
         };
         use crate::filesystem::service_javascript_fs_sync_rpc;
         use crate::plugins::s3_common::test_support::MockS3Server;
@@ -21598,7 +21599,7 @@ console.log(JSON.stringify(summary));
             );
         }
 
-        fn javascript_http_external_get_reaches_host_listener() {
+        fn javascript_http_external_get_reconnects_to_host_listener() {
             assert_node_available();
 
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind host HTTP listener");
@@ -21608,26 +21609,31 @@ console.log(JSON.stringify(summary));
                 .port();
             let (server_done_tx, server_done_rx) = mpsc::channel();
             let server = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accept host HTTP request");
-                let mut request = [0_u8; 1024];
-                let read = stream.read(&mut request).expect("read host HTTP request");
-                let request_text = String::from_utf8_lossy(&request[..read]);
-                assert!(
-                    request_text.starts_with("GET /external HTTP/1.1\r\n"),
-                    "unexpected request: {request_text:?}"
-                );
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\n\
-                          Transfer-Encoding: chunked\r\n\
-                          Connection: keep-alive\r\n\
-                          \r\n\
-                          12\r\nexternal-host-body\r\n\
-                          0\r\n\
-                          \r\n",
-                    )
-                    .expect("write host HTTP response");
-                stream.flush().expect("flush host HTTP response");
+                for request_index in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("accept host HTTP request");
+                    let mut request = [0_u8; 1024];
+                    let read = stream.read(&mut request).expect("read host HTTP request");
+                    let request_text = String::from_utf8_lossy(&request[..read]);
+                    assert!(
+                        request_text.starts_with("GET /external HTTP/1.1\r\n"),
+                        "unexpected request: {request_text:?}"
+                    );
+                    let body = format!("external-host-body-{request_index}");
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 403 Forbidden\r\n\
+                                 Content-Length: {}\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .expect("write host HTTP response");
+                    stream.flush().expect("flush host HTTP response");
+                }
                 let _ = server_done_rx.recv_timeout(Duration::from_secs(5));
             });
 
@@ -21667,29 +21673,13 @@ console.log(JSON.stringify(summary));
                 &cwd.join("entry.mjs"),
                 format!(
                     r#"
-import http from "node:http";
+const request = async () => {{
+  const response = await fetch("http://127.0.0.1:{port}/external");
+  return {{ status: response.status, body: await response.text() }};
+}};
 
 const result = await Promise.race([
-  new Promise((resolve, reject) => {{
-    const req = http.get(
-      {{
-        host: "127.0.0.1",
-        port: {port},
-        path: "/external",
-      }},
-      (res) => {{
-        let body = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => {{
-          body += chunk;
-        }});
-        res.on("end", () => {{
-          resolve({{ status: res.statusCode, body }});
-        }});
-      }},
-    );
-    req.on("error", reject);
-  }}),
+  (async () => [await request(), await request()])(),
   new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000)),
 ]);
 
@@ -21706,10 +21696,245 @@ console.log(JSON.stringify(result));
             assert_eq!(exit_code, Some(0), "stderr: {stderr}");
             let parsed: Value =
                 serde_json::from_str(stdout.trim()).expect("parse external http JSON");
-            assert_eq!(parsed["status"], json!(200));
+            assert_eq!(parsed[0]["status"], json!(403));
             assert_eq!(
-                parsed["body"],
-                Value::String(String::from("external-host-body"))
+                parsed[0]["body"],
+                Value::String(String::from("external-host-body-0"))
+            );
+            assert_eq!(parsed[1]["status"], json!(403));
+            assert_eq!(
+                parsed[1]["body"],
+                Value::String(String::from("external-host-body-1"))
+            );
+        }
+
+        fn javascript_vm_fetch_guest_handler_connects_twice_to_external_host() {
+            assert_node_available();
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind host HTTP listener");
+            let port = listener
+                .local_addr()
+                .expect("host HTTP listener address")
+                .port();
+            let server = thread::spawn(move || {
+                let mut held_connections = Vec::new();
+                for request_index in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("accept host HTTP connection");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .expect("set host HTTP read timeout");
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let mut chunk = [0_u8; 1024];
+                        let read = stream.read(&mut chunk).expect("read host HTTP request");
+                        assert!(read > 0, "host HTTP connection closed before request");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let request_text = String::from_utf8_lossy(&request);
+                    let expected = if request_index == 0 {
+                        "GET /external HTTP/1.1\r\n"
+                    } else {
+                        "PUT /external HTTP/1.1\r\n"
+                    };
+                    assert!(
+                        request_text.starts_with(expected),
+                        "unexpected request: {request_text:?}"
+                    );
+                    let body = format!("external-host-body-{request_index}");
+                    let connection = if request_index == 0 {
+                        "keep-alive"
+                    } else {
+                        "close"
+                    };
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\n\
+                                 Content-Length: {}\r\n\
+                                 Connection: {connection}\r\n\
+                                 \r\n\
+                                 {body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .expect("write host HTTP response");
+                    stream.flush().expect("flush host HTTP response");
+                    if request_index == 0 {
+                        held_connections.push(stream);
+                    }
+                }
+            });
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: Vec::new(),
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: None,
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: std::collections::HashMap::new(),
+                        loopback_exempt_ports: vec![port],
+                        packages: Vec::new(),
+                        packages_mount_at: String::new(),
+                        bootstrap_commands: Vec::new(),
+                        binding_shim_commands: Vec::new(),
+                    }),
+                ))
+                .expect("configure loopback-exempt host listener port");
+
+            let cwd = temp_dir("agentos-native-sidecar-vm-fetch-external-cwd");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                format!(
+                    r#"
+import http from "node:http";
+
+const request = async (options) => {{
+  const response = await fetch("http://127.0.0.1:{port}/external", options);
+  return {{ status: response.status, body: await response.text() }};
+}};
+
+const server = http.createServer(async (_req, res) => {{
+  try {{
+    const result = await Promise.race([
+      (async () => [
+        await request(),
+        await request({{
+          method: "PUT",
+          headers: {{ "content-type": "application/json" }},
+          body: JSON.stringify({{ name: "notes", key: "http-handler" }}),
+        }}),
+      ])(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000)),
+    ]);
+    res.writeHead(200, {{ "content-type": "application/json" }});
+    res.end(JSON.stringify(result));
+  }} catch (error) {{
+    res.writeHead(500, {{ "content-type": "text/plain" }});
+    res.end(error?.stack || String(error));
+  }}
+}});
+
+server.listen(3000, "127.0.0.1", () => {{
+  console.log("READY");
+}});
+
+await new Promise(() => {{}});
+"#
+                ),
+            );
+
+            start_fake_javascript_process(&mut sidecar, &vm_id, &cwd, "proc-js-external-server");
+            wait_for_process_stdout_contains(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-external-server",
+                "READY",
+            );
+            let response = dispatch_host_vm_fetch(
+                &mut sidecar,
+                900,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/external",
+                None,
+            )
+            .expect("host fetch reaches guest HTTP server");
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-external-server", "SIGKILL")
+                .expect("kill javascript server process");
+            server.join().expect("join host HTTP listener");
+
+            let response_json = match response.response.payload {
+                ResponsePayload::VmFetchResult(result) => result.response_json,
+                other => panic!("unexpected vm.fetch response: {other:?}"),
+            };
+            let outer: Value =
+                serde_json::from_str(&response_json).expect("parse vm.fetch response");
+            assert_eq!(outer["status"], json!(200));
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(outer["body"].as_str().expect("base64 response body"))
+                .expect("decode vm.fetch response body");
+            let parsed: Value = serde_json::from_slice(&body).expect("parse external HTTP results");
+            assert_eq!(parsed[0]["status"], json!(200));
+            assert_eq!(
+                parsed[0]["body"],
+                Value::String(String::from("external-host-body-0"))
+            );
+            assert_eq!(parsed[1]["status"], json!(200));
+            assert_eq!(
+                parsed[1]["body"],
+                Value::String(String::from("external-host-body-1"))
+            );
+        }
+
+        fn javascript_net_connect_completion_without_state_reports_eio() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("agentos-native-sidecar-js-connect-completion-cwd");
+            write_fixture(&cwd.join("entry.mjs"), "setInterval(() => {}, 1000);");
+            let process_id = "proc-js-connect-completion";
+            start_fake_javascript_process(&mut sidecar, &vm_id, &cwd, process_id);
+
+            let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
+            let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
+            let process = vm
+                .active_processes
+                .get_mut(process_id)
+                .expect("javascript process");
+            let error = settle_javascript_sync_rpc_completion(
+                process,
+                &kernel_readiness,
+                41,
+                "net.connect",
+                Ok(Value::Null),
+            )
+            .expect("settle missing connect state")
+            .expect_err("missing connect state must not become a null success");
+            assert_eq!(error.code, "EIO");
+            assert!(
+                error
+                    .message
+                    .contains("completed without its pending socket state"),
+                "unexpected error: {error:?}"
+            );
+            assert!(
+                settle_javascript_sync_rpc_completion(
+                    process,
+                    &kernel_readiness,
+                    42,
+                    "net.http_wait",
+                    Ok(Value::Null),
+                )
+                .expect("settle ordinary deferred null")
+                .expect("ordinary deferred null remains successful")
+                .is_null(),
+                "ordinary deferred null must remain null",
             );
         }
 
@@ -25398,7 +25623,7 @@ try {
             javascript_http2_secure_listen_connect_request_and_respond_round_trip();
             javascript_http2_server_respond_records_pending_response();
             javascript_http_rpc_requests_gets_and_serves_over_guest_net();
-            javascript_http_external_get_reaches_host_listener();
+            javascript_http_external_get_reconnects_to_host_listener();
             javascript_fetch_posts_to_guest_loopback_http_server();
             javascript_fetch_reaches_http_server_in_parallel_guest_process();
             javascript_net_rpc_listens_accepts_connections_and_reports_listener_state();
@@ -25588,8 +25813,18 @@ try {
         }
 
         #[test]
-        fn javascript_http_external_get_reaches_host_listener_regression() {
-            javascript_http_external_get_reaches_host_listener();
+        fn javascript_http_external_get_reconnects_to_host_listener_regression() {
+            javascript_http_external_get_reconnects_to_host_listener();
+        }
+
+        #[test]
+        fn javascript_vm_fetch_guest_handler_connects_twice_to_external_host_regression() {
+            javascript_vm_fetch_guest_handler_connects_twice_to_external_host();
+        }
+
+        #[test]
+        fn javascript_net_connect_completion_without_state_reports_eio_regression() {
+            javascript_net_connect_completion_without_state_reports_eio();
         }
 
         #[test]

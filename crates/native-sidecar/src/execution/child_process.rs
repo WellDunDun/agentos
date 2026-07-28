@@ -7183,6 +7183,7 @@ where
                                             event: ActiveExecutionEvent::JavascriptSyncRpcCompletion(
                                                 crate::state::JavascriptSyncRpcCompletion {
                                                     request_id,
+                                                    method,
                                                     result,
                                                 },
                                             ),
@@ -7327,23 +7328,13 @@ where
                     let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                         return Ok(Value::Null);
                     };
-                    let connected = child
-                        .pending_javascript_net_connects
-                        .remove(&completion.request_id);
-                    let completion_result = match (completion.result, connected) {
-                        (Ok(_), Some(connected)) => {
-                            finalize_javascript_net_connect(child, &kernel_readiness, connected)
-                                .map_err(|error| crate::state::DeferredRpcError {
-                                    code: javascript_sync_rpc_error_code(&error),
-                                    message: javascript_sync_rpc_error_message(&error),
-                                })
-                        }
-                        (result @ Err(_), Some(connected)) => {
-                            restore_pending_bound_unix_connect(child, &connected)?;
-                            result
-                        }
-                        (result, None) => result,
-                    };
+                    let completion_result = settle_javascript_sync_rpc_completion(
+                        child,
+                        &kernel_readiness,
+                        completion.request_id,
+                        &completion.method,
+                        completion.result,
+                    )?;
                     let result = match completion_result {
                         Ok(value) => child
                             .execution
