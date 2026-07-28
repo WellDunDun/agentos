@@ -19,6 +19,7 @@ import {
 	migrateAppsTables,
 	normalizeScaling,
 	normalizeServerlessCallbackPath,
+	normalizeWarmTimeout,
 	replicaGuestEnvironment,
 	replicaLoopbackExemptPorts,
 	resolveAppCallbackSecret,
@@ -30,6 +31,7 @@ import {
 	type ResolvedRivetConnection,
 } from "../src/control-plane.js";
 import { deployApp } from "../src/deploy.js";
+import { AgentOSAppsError } from "../src/errors.js";
 import { setupApps } from "../src/index.js";
 import {
 	type AgentOSAppsRoutingClient,
@@ -84,6 +86,7 @@ function typecheckPublicApi(): void {
 			"index.html": "<h1>Hello</h1>",
 			"logo.png": new Uint8Array([137, 80, 78, 71]),
 		},
+		warmTimeoutMs: 120_000,
 		scaling: { maxReplicas: 16 },
 	});
 }
@@ -144,6 +147,17 @@ describe("public API", () => {
 		});
 		expect(() => normalizeScaling({ minReplicas: 2, maxReplicas: 1 })).toThrow(
 			"cannot exceed",
+		);
+	});
+
+	test("bounds replica warm timeouts in the actor implementation", () => {
+		expect(normalizeWarmTimeout(undefined)).toBe(30_000);
+		expect(normalizeWarmTimeout(120_000)).toBe(120_000);
+		expect(() => normalizeWarmTimeout(999)).toThrow(
+			"warmTimeoutMs must be an integer between 1000 and 600000",
+		);
+		expect(() => normalizeWarmTimeout(600_001)).toThrow(
+			"warmTimeoutMs must be an integer between 1000 and 600000",
 		);
 	});
 });
@@ -298,6 +312,7 @@ describe("source loading and deployment facade", () => {
 		const result = await deployApp(
 			{
 				appId: "memory-app",
+				warmTimeoutMs: 120_000,
 				files: {
 					"index.html": "<h1>Hello</h1>",
 					"asset.bin": new Uint8Array([0, 255]),
@@ -318,6 +333,7 @@ describe("source loading and deployment facade", () => {
 			key: ["memory-app"],
 			input: {
 				appId: "memory-app",
+				warmTimeoutMs: 120_000,
 				namespace: "existing",
 				runtime: {
 					pool: appRunnerPool("memory-app"),
@@ -329,6 +345,164 @@ describe("source loading and deployment facade", () => {
 			},
 		});
 		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	test("marks a bare internal_error as a server fault at the deployApp boundary", async () => {
+		vi.stubEnv("RIVET_ENGINE", "http://existing.test");
+		vi.stubEnv("RIVET_NAMESPACE", "existing");
+		const internalError = { code: "internal_error" };
+
+		const error = await deployApp(
+			{
+				appId: "bare-server-fault-app",
+				files: { "index.html": "hello" },
+			},
+			{
+				client: {
+					agentOSAppsApp: {
+						getOrCreate: () => ({
+							deploy: async () => {
+								throw internalError;
+							},
+						}),
+					},
+				},
+			},
+		).catch((cause) => cause);
+
+		expect(error).toBeInstanceOf(AgentOSAppsError);
+		expect(error).toMatchObject({
+			code: "agentos_apps_server_fault",
+			serverFault: true,
+			metadata: {
+				serverFault: true,
+				chain: [{ code: "internal_error" }],
+			},
+		});
+		expect(error.cause).toBe(internalError);
+	});
+
+	test("bounds and redacts opaque deploy error chains", async () => {
+		vi.stubEnv("RIVET_ENGINE", "http://existing.test");
+		vi.stubEnv("RIVET_NAMESPACE", "existing");
+		const platformError = Object.assign(
+			new Error(
+				"request to http://engine.test/private-capability?token=secret failed with Authorization: Bearer secret-value",
+				{
+					cause: Object.assign(new Error("socket closed"), {
+						code: "ECONNRESET",
+					}),
+				},
+			),
+			{ code: "internal_error", status: 500 },
+		);
+		const client = {
+			agentOSAppsApp: {
+				getOrCreate: () => ({
+					deploy: async () => {
+						throw platformError;
+					},
+				}),
+			},
+		};
+
+		const error = await deployApp(
+			{
+				appId: "server-fault-app",
+				files: { "index.html": "hello" },
+			},
+			{ client },
+		).catch((cause) => cause);
+
+		expect(error).toBeInstanceOf(AgentOSAppsError);
+		expect(error).toMatchObject({
+			code: "agentos_apps_server_fault",
+			serverFault: true,
+			metadata: {
+				serverFault: true,
+				chain: [
+					expect.objectContaining({
+						code: "internal_error",
+						status: 500,
+					}),
+					expect.objectContaining({ code: "ECONNRESET" }),
+				],
+			},
+		});
+		expect(JSON.stringify(error.metadata)).not.toContain("private-capability");
+		expect(JSON.stringify(error.metadata)).not.toContain("secret-value");
+		expect(error.cause).toBe(platformError);
+	});
+
+	test("preserves app diagnostics without a server-fault marker", async () => {
+		vi.stubEnv("RIVET_ENGINE", "http://existing.test");
+		const diagnostic = {
+			code: "agentos_apps_build_failed",
+			message: "src/index.ts:3: missing export",
+			metadata: { phase: "build" },
+		};
+
+		await expect(
+			deployApp(
+				{
+					appId: "build-failure-app",
+					files: { "index.html": "hello" },
+				},
+				{
+					client: {
+						agentOSAppsApp: {
+							getOrCreate: () => ({
+								deploy: async () => {
+									throw diagnostic;
+								},
+							}),
+						},
+					},
+				},
+			),
+		).rejects.toBe(diagnostic);
+	});
+
+	test("classifies replica warm timeouts as server faults, not source diagnostics", async () => {
+		vi.stubEnv("RIVET_ENGINE", "http://existing.test");
+		const warmFailure = {
+			code: "agentos_apps_replica_warm_timeout",
+			message:
+				"execution replica did not become ready within warmTimeoutMs 120000",
+			metadata: { warmTimeoutMs: 120_000 },
+		};
+
+		const error = await deployApp(
+			{
+				appId: "warm-failure-app",
+				files: { "index.html": "hello" },
+				warmTimeoutMs: 120_000,
+			},
+			{
+				client: {
+					agentOSAppsApp: {
+						getOrCreate: () => ({
+							deploy: async () => {
+								throw warmFailure;
+							},
+						}),
+					},
+				},
+			},
+		).catch((cause) => cause);
+
+		expect(error).toMatchObject({
+			code: "agentos_apps_server_fault",
+			serverFault: true,
+			metadata: {
+				chain: [
+					expect.objectContaining({
+						code: "agentos_apps_replica_warm_timeout",
+						message: expect.stringContaining("warmTimeoutMs 120000"),
+					}),
+				],
+			},
+		});
 	});
 
 	test("creates a namespace only when requested by deployApp", async () => {
@@ -588,6 +762,7 @@ describe("serverless callback credentials", () => {
 				minReplicas: 0,
 				maxReplicas: 128,
 				targetConcurrency: 8,
+				warmTimeoutMs: 120_000,
 			}),
 			namespace: "app-hello",
 			envoy_version: 1,
@@ -681,9 +856,21 @@ describe("serverless callback credentials", () => {
 			"x-agentos-app-callback-token",
 		);
 		expect(release).toHaveBeenCalledWith("admission-1");
-		await expect(
-			actions.getRelease!(context, "release-1"),
-		).resolves.not.toHaveProperty("callbackSecret");
+
+		const ordinary = await onRequest(
+			context,
+			new Request("http://host.test/dashboard"),
+		);
+		expect(ordinary.status).toBe(200);
+		expect(await ordinary.text()).toBe("metadata");
+		expect(new URL(String(replicaFetch.mock.calls[1]![0])).pathname).toBe(
+			"/dashboard",
+		);
+		expect(replicaFetch).toHaveBeenCalledTimes(2);
+
+		const publicRelease = await actions.getRelease!(context, "release-1");
+		expect(publicRelease).toMatchObject({ warmTimeoutMs: 120_000 });
+		expect(publicRelease).not.toHaveProperty("callbackSecret");
 		const inspection = await actions.inspect!(context);
 		expect(inspection.releases[0]).not.toHaveProperty("callbackSecret");
 	});
@@ -811,6 +998,95 @@ describe("HTTP router", () => {
 });
 
 describe("regional scaler", () => {
+	test("uses the release warmTimeoutMs in the replica readiness loop", async () => {
+		vi.useFakeTimers({ now: 0 });
+		try {
+			const definitions = createAppsActors();
+			const actions = definitions.agentOSAppsScaler.config.actions as Record<
+				string,
+				(...args: any[]) => any
+			>;
+			const state = (
+				(definitions.agentOSAppsScaler.config as any)
+					.createState as () => ScalerState
+			)();
+			const release = {
+				release: "release-timeout",
+				artifactHash: "hash",
+				artifactBytes: 4,
+				createdAt: Date.now(),
+				regions: ["us-west"],
+				scaling: {
+					minReplicas: 0,
+					maxReplicas: 2,
+					targetConcurrency: 1,
+				},
+				warmTimeoutMs: 1_000,
+				status: "ready" as const,
+				entrypoint: "index.js",
+				namespace: "app-hello",
+				envoyVersion: 1,
+				runtimeEndpoint: "http://localhost:6420",
+				runtimePool: "agentos-apps-guest",
+				usesRivetKit: false,
+			};
+			const replica = {
+				configure: vi.fn(async () => undefined),
+				inspect: vi.fn(async () => ({ release: null, startedAt: null })),
+				vmFetch: vi.fn(async () => ({
+					status: 503,
+					statusText: "Service Unavailable",
+					headers: {},
+					body: new Uint8Array(),
+				})),
+				markStarted: vi.fn(async () => undefined),
+				destroy: vi.fn(async () => undefined),
+			};
+			const context = {
+				actorId: "scaler-release-timeout",
+				key: ["hello", release.release, "us-west"],
+				region: "us-west",
+				state,
+				client: () => ({
+					agentOSAppsApp: {
+						getOrCreate: () => ({ getRelease: async () => release }),
+					},
+					agentOSAppsReplica: { getOrCreate: () => replica },
+				}),
+				keepAwake: <T>(promise: Promise<T>) => promise,
+				schedule: { after: vi.fn(async () => undefined) },
+				log: logger(),
+				destroy: vi.fn(),
+			};
+
+			const outcome = actions
+				.prepare(context, {
+					appId: "hello",
+					release,
+					region: "us-west",
+					verifyReplica: true,
+				})
+				.then(
+					() => ({ error: undefined }),
+					(error: unknown) => ({ error }),
+				);
+			await vi.runAllTimersAsync();
+
+			expect(await outcome).toMatchObject({
+				error: {
+					message:
+						"execution replica did not become ready within warmTimeoutMs 1000",
+				},
+			});
+			expect(Date.now()).toBe(1_000);
+			expect(state.warmTimeoutMs).toBe(1_000);
+			expect(replica.destroy).toHaveBeenCalledTimes(1);
+			expect(state.warmingReplicas).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("warns on upward 50% crossings, retains warm replicas, and scales to zero", async () => {
 		const definitions = createAppsActors();
 		const actions = definitions.agentOSAppsScaler.config.actions as Record<

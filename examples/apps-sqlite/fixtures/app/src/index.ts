@@ -1,4 +1,5 @@
 import { actor, setup } from "rivetkit";
+import { createClient } from "rivetkit/client";
 import { db } from "rivetkit/db";
 
 const notes = actor({
@@ -28,9 +29,19 @@ export const registry = setup({
 
 registry.start();
 
-export default function fetch() {
+const client = createClient<typeof registry>();
+
+export default async function fetch() {
+	const scopedNotes = client.notes.getOrCreate(["http-handler"]);
+	await scopedNotes.add("written from the guest HTTP handler");
+	const rows = (await scopedNotes.list()) as Array<{
+		id: number;
+		body: string;
+	}>;
 	return Response.json({
 		app: "sqlite-notes",
-		message: "Use the RivetKit client to add and list notes.",
+		message: "The guest used its scoped RivetKit client.",
+		scopedActorRows: rows.length,
+		lastScopedActorBody: rows.at(-1)?.body,
 	});
 }

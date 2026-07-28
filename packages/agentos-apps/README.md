@@ -89,7 +89,16 @@ deployment returns its stable `pool` along with its `namespace` for ordinary
 DirectActor clients.
 
 The `scaling` options default to `minReplicas: 0`, `maxReplicas: 128`, and
-`targetConcurrency: 8`.
+`targetConcurrency: 8`. Replica startup waits up to 30 seconds by default.
+Set `warmTimeoutMs` on `deployApp()` to an integer from 1,000 through 600,000
+milliseconds when an application needs a longer bounded startup window.
+
+Deployment failures caused by the host platform are returned as
+`AgentOSAppsError` with `serverFault: true`, code
+`agentos_apps_server_fault`, and a bounded, redacted diagnostic chain in
+`metadata.chain`. Build and source diagnostics do not set the marker, so
+automated repair loops can stop rewriting valid source and surface or retry the
+platform operation separately.
 
 Guest Rivet Actors use the ordinary DirectActor API from `rivetkit/client`.
 agentOS Apps does not export or wrap a RivetKit client. Host management tokens

@@ -12,6 +12,11 @@ interface DeployAppBase {
 	 * the namespace already configured for the ordinary Rivet connection.
 	 */
 	createNamespace?: boolean;
+	/**
+	 * Maximum time to wait for each execution replica to become ready.
+	 * Defaults to 30 seconds and must be between 1 second and 10 minutes.
+	 */
+	warmTimeoutMs?: number;
 	regions?: string[];
 	scaling?: AppScaling;
 }
@@ -43,6 +48,7 @@ export interface AppReleaseInfo {
 	createdAt: number;
 	regions: string[];
 	scaling: Required<AppScaling>;
+	warmTimeoutMs: number;
 	status: "building" | "ready" | "failed";
 	error?: string;
 }
@@ -50,6 +56,7 @@ export interface AppReleaseInfo {
 export interface PreparedDeployAppInput {
 	appId: string;
 	files: Record<string, Uint8Array>;
+	warmTimeoutMs?: number;
 	regions?: string[];
 	scaling?: AppScaling;
 	namespace: string;

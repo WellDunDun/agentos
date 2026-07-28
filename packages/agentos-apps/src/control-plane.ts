@@ -28,6 +28,7 @@ async function readBoundedJson(response: Response): Promise<unknown> {
 					"agentos_apps_control_response_limit",
 					`Rivet control response exceeded ${MAX_CONTROL_RESPONSE_BYTES} bytes`,
 					{ limit: MAX_CONTROL_RESPONSE_BYTES },
+					{ serverFault: true },
 				);
 			}
 			chunks.push(value);
@@ -111,6 +112,7 @@ export async function provisionAppNamespace(
 				"agentos_apps_namespace_lookup_failed",
 				`Rivet namespace lookup failed with HTTP ${response.status}`,
 				{ status: response.status },
+				{ serverFault: true },
 			);
 		}
 		const body = (await readBoundedJson(response)) as {
@@ -136,6 +138,7 @@ export async function provisionAppNamespace(
 				"agentos_apps_namespace_create_failed",
 				`Rivet namespace creation failed with HTTP ${response.status}`,
 				{ status: response.status },
+				{ serverFault: true },
 			);
 		}
 	}
@@ -172,6 +175,7 @@ export async function configureAppNamespaceRunner(
 				pool: runtime.pool,
 				error: error instanceof Error ? error.message : String(error),
 			},
+			{ serverFault: true, cause: error },
 		);
 	}
 }

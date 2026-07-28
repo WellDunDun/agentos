@@ -55,6 +55,8 @@ const DEFAULT_MAX_VERSIONS = 20;
 const DEFAULT_MAX_REGIONS = 8;
 const DEFAULT_BUILD_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_WARM_TIMEOUT_MS = 30_000;
+const MIN_WARM_TIMEOUT_MS = 1_000;
+const MAX_WARM_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_WARM_IDLE_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_ADMISSION_LEASE_MS = 60_000;
 const DEFAULT_MAX_ADMISSIONS = 4_096;
@@ -131,6 +133,7 @@ export interface ScalerState {
 	release: string | null;
 	region: string | null;
 	scaling: Required<AppScaling> | null;
+	warmTimeoutMs?: number;
 	replicas: ReplicaRecord[];
 	warmingReplicas: number;
 	warmingReplicaKeys?: string[][];
@@ -436,6 +439,27 @@ export function normalizeScaling(
 	return { minReplicas, maxReplicas, targetConcurrency };
 }
 
+/** @internal Exported for focused validation tests. */
+export function normalizeWarmTimeout(value: number | undefined): number {
+	const warmTimeoutMs = value ?? DEFAULT_WARM_TIMEOUT_MS;
+	if (
+		!Number.isInteger(warmTimeoutMs) ||
+		warmTimeoutMs < MIN_WARM_TIMEOUT_MS ||
+		warmTimeoutMs > MAX_WARM_TIMEOUT_MS
+	) {
+		fail(
+			"agentos_apps_invalid_warm_timeout",
+			`warmTimeoutMs must be an integer between ${MIN_WARM_TIMEOUT_MS} and ${MAX_WARM_TIMEOUT_MS}`,
+			{
+				warmTimeoutMs,
+				minimum: MIN_WARM_TIMEOUT_MS,
+				maximum: MAX_WARM_TIMEOUT_MS,
+			},
+		);
+	}
+	return warmTimeoutMs;
+}
+
 /** @internal Exported for focused migration tests. */
 export async function migrateAppsTables(database: RawAccess): Promise<void> {
 	await database.execute(`
@@ -599,6 +623,9 @@ interface ReleaseRow extends Record<string, unknown> {
 }
 
 function releaseFromRow(row: ReleaseRow): StoredAppRelease {
+	const storedScaling = JSON.parse(row.scaling_json) as Required<AppScaling> & {
+		warmTimeoutMs?: number;
+	};
 	return {
 		release: row.release_id,
 		createdAt: Number(row.created_at),
@@ -608,13 +635,18 @@ function releaseFromRow(row: ReleaseRow): StoredAppRelease {
 		artifactBytes: Number(row.artifact_bytes),
 		error: row.build_error ?? undefined,
 		regions: JSON.parse(row.regions_json) as string[],
-		scaling: JSON.parse(row.scaling_json) as Required<AppScaling>,
+		scaling: {
+			minReplicas: storedScaling.minReplicas,
+			maxReplicas: storedScaling.maxReplicas,
+			targetConcurrency: storedScaling.targetConcurrency,
+		},
 		namespace: row.namespace,
 		envoyVersion: Number(row.envoy_version),
 		runtimeEndpoint: row.runtime_endpoint,
 		runtimePool: row.runtime_pool,
 		callbackSecret: row.callback_secret ?? "",
 		usesRivetKit: Number(row.uses_rivetkit ?? 0) === 1,
+		warmTimeoutMs: normalizeWarmTimeout(storedScaling.warmTimeoutMs),
 	};
 }
 
@@ -1426,7 +1458,6 @@ export function createAppsActors(
 	const maxRegions = DEFAULT_MAX_REGIONS;
 	const maxDependencies = DEFAULT_MAX_DEPENDENCIES;
 	const buildTimeoutMs = DEFAULT_BUILD_TIMEOUT_MS;
-	const warmTimeoutMs = DEFAULT_WARM_TIMEOUT_MS;
 	const warmIdleTimeoutMs = DEFAULT_WARM_IDLE_TIMEOUT_MS;
 	const admissionLeaseMs = DEFAULT_ADMISSION_LEASE_MS;
 	const maxAdmissions = DEFAULT_MAX_ADMISSIONS;
@@ -1551,7 +1582,7 @@ export function createAppsActors(
 			forwardedUrl.pathname =
 				serverlessCallbackPath ??
 				`/${forwardedUrl.pathname.replace(/^\/+/, "")}`;
-			if (serverlessCallbackPath) {
+			if (release.usesRivetKit) {
 				const guestResponse = await replica.fetch(forwardedUrl, {
 					method: request.method,
 					headers,
@@ -1588,11 +1619,21 @@ export function createAppsActors(
 					});
 				}
 				const reader = guestResponse.body?.getReader();
+				let responseBytes = 0;
 				const responseBody = reader
 					? new ReadableStream<Uint8Array>({
 							async pull(controller) {
 								try {
 									const chunk = await reader.read();
+									responseBytes += chunk.value?.byteLength ?? 0;
+									if (responseBytes > maxResponseBytes) {
+										await reader.cancel("AgentOS Apps response limit exceeded");
+										throw new AgentOSAppsError(
+											"agentos_apps_response_limit",
+											`response exceeds maxResponseBytes ${maxResponseBytes}; raise maxResponseBytes to allow a larger response`,
+											{ maxResponseBytes },
+										);
+									}
 									if (chunk.done) {
 										controller.close();
 										await releaseAdmission();
@@ -1616,6 +1657,22 @@ export function createAppsActors(
 						})
 					: null;
 				if (!reader) await releaseAdmission();
+				if (!serverlessCallbackPath) {
+					responseHeaders.set("x-agentos-app-replica", admission.key.join("/"));
+					responseHeaders.set("x-agentos-app-release", admission.release);
+					responseHeaders.set(
+						"x-agentos-app-replica-count",
+						String(admission.replicaCount),
+					);
+					responseHeaders.set(
+						"x-agentos-app-queue-delay-ms",
+						String(admission.queueDelayMs),
+					);
+					responseHeaders.set(
+						"x-agentos-app-cold-start",
+						admission.coldStart ? "1" : "0",
+					);
+				}
 				return new Response(responseBody, {
 					status: guestResponse.status,
 					statusText: guestResponse.statusText,
@@ -1783,7 +1840,7 @@ export function createAppsActors(
 			],
 		},
 		options: {
-			actionTimeout: buildTimeoutMs + warmTimeoutMs + 60_000,
+			actionTimeout: buildTimeoutMs + MAX_WARM_TIMEOUT_MS + 60_000,
 		},
 		db: db({ onMigrate: migrateAppsTables }),
 		createState: (): AppState => ({
@@ -1819,6 +1876,7 @@ export function createAppsActors(
 							maxRegions,
 						);
 						const scaling = normalizeScaling(input.scaling);
+						const warmTimeoutMs = normalizeWarmTimeout(input.warmTimeoutMs);
 						const releaseId = canonicalDeploymentHash({
 							files: input.files,
 							entrypoint: plan.entrypoint,
@@ -1834,6 +1892,7 @@ export function createAppsActors(
 							deploymentIdentity: JSON.stringify({
 								regions,
 								scaling,
+								warmTimeoutMs,
 								namespace: input.namespace,
 								runtime: input.runtime,
 								usesRivetKit: plan.usesRivetKit,
@@ -1892,6 +1951,7 @@ export function createAppsActors(
 								createdAt: release?.createdAt ?? Date.now(),
 								regions,
 								scaling,
+								warmTimeoutMs,
 								status: "building",
 								entrypoint: plan.entrypoint,
 								namespace: input.namespace,
@@ -1929,7 +1989,7 @@ export function createAppsActors(
 									"building",
 									plan.entrypoint,
 									JSON.stringify(regions),
-									JSON.stringify(scaling),
+									JSON.stringify({ ...scaling, warmTimeoutMs }),
 									input.namespace,
 									envoyVersion,
 									input.runtime.endpoint,
@@ -2049,6 +2109,7 @@ export function createAppsActors(
 								...release,
 								regions,
 								scaling,
+								warmTimeoutMs,
 								envoyVersion,
 								runtimeEndpoint: input.runtime.endpoint,
 								runtimePool: input.runtime.pool,
@@ -2061,7 +2122,7 @@ export function createAppsActors(
 								     uses_rivetkit = ?
 								 WHERE release_id = ?`,
 								JSON.stringify(regions),
-								JSON.stringify(scaling),
+								JSON.stringify({ ...scaling, warmTimeoutMs }),
 								envoyVersion,
 								input.runtime.endpoint,
 								input.runtime.pool,
@@ -2074,6 +2135,7 @@ export function createAppsActors(
 							...release,
 							regions,
 							scaling,
+							warmTimeoutMs,
 						};
 						const client = c.client();
 						const rolloutResults = await Promise.allSettled(
@@ -2456,6 +2518,7 @@ export function createAppsActors(
 			const release = (await client[APP_ACTOR_NAME]
 				.getOrCreate([appId])
 				.getRelease(releaseId)) as StoredAppRelease;
+			const warmTimeoutMs = normalizeWarmTimeout(release.warmTimeoutMs);
 			handle = client[REPLICA_ACTOR_NAME].getOrCreate(key, {
 				createInRegion: region,
 			}) as ReplicaHandle;
@@ -2573,6 +2636,7 @@ export function createAppsActors(
 		release: string;
 		region: string;
 		scaling: Required<AppScaling>;
+		warmTimeoutMs: number;
 	} {
 		const state = c.state as ScalerState;
 		if (!state.appId || !state.release || !state.region || !state.scaling) {
@@ -2592,6 +2656,7 @@ export function createAppsActors(
 		state.warmingReplicaKeys ??= [];
 		state.warmingReplicas = state.warmingReplicaKeys.length;
 		state.capacityWarningLatched ??= false;
+		state.warmTimeoutMs = normalizeWarmTimeout(state.warmTimeoutMs);
 		for (const replica of state.replicas) {
 			replica.activeRequests ??= 0;
 			replica.lastUsedAt ??= replica.readyAt;
@@ -2602,6 +2667,7 @@ export function createAppsActors(
 			release: string;
 			region: string;
 			scaling: Required<AppScaling>;
+			warmTimeoutMs: number;
 		};
 	}
 
@@ -2688,13 +2754,14 @@ export function createAppsActors(
 			],
 		},
 		options: {
-			actionTimeout: warmTimeoutMs + 30_000,
+			actionTimeout: MAX_WARM_TIMEOUT_MS + 30_000,
 		},
 		createState: (): ScalerState => ({
 			appId: null,
 			release: null,
 			region: null,
 			scaling: null,
+			warmTimeoutMs: DEFAULT_WARM_TIMEOUT_MS,
 			replicas: [],
 			warmingReplicas: 0,
 			warmingReplicaKeys: [],
@@ -2780,6 +2847,9 @@ export function createAppsActors(
 							state.release = input.release.release;
 							state.region = input.region;
 							state.scaling = input.release.scaling;
+							state.warmTimeoutMs = normalizeWarmTimeout(
+								input.release.warmTimeoutMs,
+							);
 							state.retired = false;
 							state.selectionCursor ??= 0;
 							state.nextReplicaIndex ??=
@@ -2846,7 +2916,8 @@ export function createAppsActors(
 						if ((c.state as ScalerState).replicas.length === 0) {
 							coldStart = await addReplica(c);
 							if (!coldStart) {
-								const deadline = Date.now() + warmTimeoutMs;
+								const state = requireScalerState(c);
+								const deadline = Date.now() + state.warmTimeoutMs;
 								while (
 									(c.state as ScalerState).replicas.length === 0 &&
 									Date.now() < deadline
@@ -3718,13 +3789,6 @@ export function createAppsActors(
 			};
 		},
 		onRequest: async (c: any, request: Request): Promise<Response> => {
-			const pathname = new URL(request.url).pathname;
-			if (
-				pathname !== "/api/rivet/metadata" &&
-				pathname !== "/api/rivet/start"
-			) {
-				return new Response("Not Found", { status: 404 });
-			}
 			const bridge = guestBridges.get(c.actorId);
 			if (!bridge) {
 				return new Response("AgentOS Apps guest is not ready", { status: 503 });

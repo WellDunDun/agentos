@@ -170,6 +170,7 @@ async function verify(): Promise<void> {
 						maxReplicas: 2,
 						targetConcurrency: 2,
 					}),
+					warmTimeoutMs: 120_000,
 					namespace: runtime.namespace,
 					runtime: {
 						endpoint: runtime.endpoint,
@@ -188,6 +189,7 @@ async function verify(): Promise<void> {
 			appId: "agentos-apps-e2e",
 			createNamespace: true,
 			files: rivetKitFiles,
+			warmTimeoutMs: 120_000,
 			scaling: {
 				maxReplicas: 2,
 				targetConcurrency: 2,
@@ -216,13 +218,35 @@ async function verify(): Promise<void> {
 		const firstBody = (await firstResponse.json()) as {
 			app?: unknown;
 			message?: unknown;
+			scopedActorRows?: unknown;
+			lastScopedActorBody?: unknown;
 		};
 		if (
 			firstBody.app !== "sqlite-notes" ||
-			typeof firstBody.message !== "string"
+			firstBody.message !== "The guest used its scoped RivetKit client." ||
+			firstBody.scopedActorRows !== 1 ||
+			firstBody.lastScopedActorBody !== "written from the guest HTTP handler"
 		) {
 			throw new Error(
-				"the packed RivetKit SQLite application returned the wrong body",
+				`the packed RivetKit application did not persist its first guest-scoped actor call: ${JSON.stringify(firstBody)}`,
+			);
+		}
+		const secondResponse = await appsRouter.request("/agentos-apps-e2e/");
+		if (!secondResponse.ok) {
+			throw new Error(
+				`second HTTP request failed with ${secondResponse.status}`,
+			);
+		}
+		const secondBody = (await secondResponse.json()) as {
+			scopedActorRows?: unknown;
+			lastScopedActorBody?: unknown;
+		};
+		if (
+			secondBody.scopedActorRows !== 2 ||
+			secondBody.lastScopedActorBody !== "written from the guest HTTP handler"
+		) {
+			throw new Error(
+				`guest-scoped actor state did not advance across HTTP requests: ${JSON.stringify(firstBody)} -> ${JSON.stringify(secondBody)}`,
 			);
 		}
 		const load = await runLoadTest(
@@ -292,12 +316,16 @@ async function verify(): Promise<void> {
 		if (fast) {
 			console.log(
 				JSON.stringify(
-						{
-							hello,
-							deployment,
-							realRivetKitPackage: true,
-							localRivetKitTarball: Boolean(localRivetKitTarball),
-							directActorRowCounts: [first.length, second.length],
+					{
+						hello,
+						deployment,
+						realRivetKitPackage: true,
+						localRivetKitTarball: Boolean(localRivetKitTarball),
+						directActorRowCounts: [first.length, second.length],
+						scopedActorRowCounts: [
+							firstBody.scopedActorRows,
+							secondBody.scopedActorRows,
+						],
 						load,
 						scaledLoad,
 						fast: true,
@@ -376,6 +404,10 @@ async function verify(): Promise<void> {
 					realRivetKitPackage: true,
 					localRivetKitTarball: Boolean(localRivetKitTarball),
 					directActorRowCounts: [first.length, second.length, third.length],
+					scopedActorRowCounts: [
+						firstBody.scopedActorRows,
+						secondBody.scopedActorRows,
+					],
 					load,
 					replacedReplica: oldReplica.join("/"),
 					coldStart:

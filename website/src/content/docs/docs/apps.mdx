@@ -154,11 +154,14 @@ compile. An agent can use those diagnostics to repair the files and call
 `deployApp()` again:
 
 ```ts
+import { AgentOSAppsError } from "@rivet-dev/agentos-apps";
+
 for (let attempt = 0; attempt < 3; attempt++) {
   try {
     await deployApp({ appId: "generated-app", files });
     break;
   } catch (error) {
+    if (error instanceof AgentOSAppsError && error.serverFault) throw error;
     if (attempt === 2) throw error;
     files = await repairWithAgent(files, String(error));
   }
@@ -167,6 +170,9 @@ for (let attempt = 0; attempt < 3; attempt++) {
 
 A failed build does not replace the currently active release. See the
 [AI App Builder example](https://github.com/rivet-dev/agentos/tree/main/examples/apps-ai-builder).
+Host/platform failures use `agentos_apps_server_fault`, set `serverFault: true`,
+and include a bounded, redacted error chain in `metadata.chain`; changing app
+source cannot repair those failures.
 
 `appId` must contain 1–63 lowercase letters, numbers, or hyphens. Pass exactly
 one of `source` or `files`.
@@ -191,13 +197,15 @@ await deployApp({
 | --- | --- |
 | `regions` | Current Rivet region |
 | `createNamespace` | `false` |
+| `warmTimeoutMs` | `30000` |
 | `scaling.minReplicas` | `0` |
 | `scaling.maxReplicas` | `128` |
 | `scaling.targetConcurrency` | `8` |
 
 By default, apps use the namespace configured on the ordinary Rivet client.
 Enable `createNamespace` only when the app needs its own namespace; it requires
-Rivet namespace list and create permissions.
+Rivet namespace list and create permissions. `warmTimeoutMs` is the bounded
+per-replica startup deadline and must be from `1000` through `600000`.
 
 ## Route requests
 
