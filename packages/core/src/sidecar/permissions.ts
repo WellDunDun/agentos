@@ -4,6 +4,29 @@ import type { Permissions } from "../runtime-compat.js";
 const ALL_OPERATIONS = ["*"];
 const ALL_RESOURCES = ["**"];
 
+/**
+ * Direct-client baseline. Guest execution essentials remain available inside
+ * the VM, while external I/O is an explicit opt-in so it cannot become a
+ * high-resolution remote timing source by default.
+ */
+export const defaultAgentOsPermissions: Permissions = {
+	fs: "allow",
+	network: "deny",
+	childProcess: "allow",
+	process: "allow",
+	env: "allow",
+	binding: "allow",
+};
+
+export function resolveAgentOsPermissions(
+	permissions?: Permissions,
+): Permissions {
+	return {
+		...defaultAgentOsPermissions,
+		...permissions,
+	};
+}
+
 function serializeFilesystemScope(
 	scope: Exclude<Permissions["fs"], string | undefined>,
 ) {

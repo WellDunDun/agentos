@@ -109,11 +109,11 @@ Two corollaries that are easy to get wrong:
 
 Each agentOS actor runs in its own isolated VM.
 
-- **Sandboxed execution.** All agent code runs inside a V8 isolate with WebAssembly. No code escapes the isolate boundary.
+- **Sandboxed execution.** All agent code runs inside a V8 isolate with WebAssembly. Mutually untrusted VMs also get separate sidecar OS processes by default, because an isolate alone is not a speculative-execution boundary.
 - **Virtual filesystem.** The VM has its own in-memory filesystem. Guest reads and writes never reach the real host filesystem. Agents cannot access host files unless explicitly mounted.
 - **Virtual network.** The VM has no direct access to the host network. Outbound requests are proxied through the host with configurable controls.
 - **Process isolation.** No host process is visible or accessible from inside the VM.
-- **Per-actor containment.** Each actor is its own VM. Two actors share no filesystem, globals, module state, memory, or crash fate. The sidecar process that hosts those VMs may be shared by default as a performance optimization, but isolation is enforced at the VM level, not the host-process level.
+- **Per-actor containment.** Each actor is its own VM and, by default, its own sidecar process. Two actors share no filesystem, globals, module state, memory, address space, or crash fate. Explicit shared-sidecar placement is a same-trust-domain performance optimization, not a boundary between mutually untrusted tenants.
 
 ### Kernel-owned syscall paths
 
@@ -152,7 +152,7 @@ The VM bounds guest execution so runaway or hostile code cannot hang or exhaust 
 
 - **Timeouts and cancellation** kill or cancel a run from the outside.
 - **Memory, CPU-time, and payload limits** are enforced by the VM.
-- **Timing-side-channel mitigation.** In the default mode, high-resolution clocks (`Date.now()`, `performance.now()`, `process.hrtime()`) are frozen within a run and `SharedArrayBuffer` is removed, to blunt timing side channels of the kind used in Spectre-style attacks.
+- **Timing defenses in depth.** In the default mode, high-resolution clocks (`Date.now()`, `performance.now()`, `process.hrtime()`) are frozen within a run and `SharedArrayBuffer` is removed. Those controls raise the cost of timing attacks, but remote I/O can still act as a timer; the default cross-tenant boundary is the sidecar OS process, not timer coarsening or a V8 isolate.
 
 See [Security & Auth](/agentos/docs/security-model) for resource limits, network control, and authentication setup.
 
@@ -163,7 +163,7 @@ See [Security & Auth](/agentos/docs/security-model) for resource limits, network
 - Agent code cannot access host environment variables or secrets.
 - Each actor's filesystem, sessions, and state are isolated from other actors.
 - Resource limits (CPU, memory) are enforced at the VM level.
-- A crash, resource exhaustion, or escape attempt is contained to a single VM; other VMs keep running, even when they share a sidecar process.
+- With default placement, a crash, resource exhaustion, or escape attempt is contained to the VM's dedicated sidecar process.
 
 ## What you are responsible for
 
@@ -172,6 +172,7 @@ The boundary protects the host from the guest. It does **not** harden your host 
 - Hardening the host process and deployment environment. For internet-facing workloads that take untrusted input, run your host inside an already-hardened environment (for example AWS Lambda, Google Cloud Run, or a similar sandboxed platform).
 - Validating authentication tokens in `onBeforeConnect`.
 - Scoping [permissions](/agentos/docs/permissions) appropriately for your use case.
+- Putting only same-trust-domain VMs on an explicit shared sidecar handle or pool.
 - Managing API keys and secrets on the host side (see [Models & Credentials](/agentos/docs/models-and-credentials)).
 - Configuring [resource limits and network controls](/agentos/docs/security-model) to match your threat model.
 - Choosing your blast radius: prefer a fresh VM per untrusted or high-risk task so an escape attempt cannot outlive a single VM.

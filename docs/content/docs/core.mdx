@@ -49,16 +49,16 @@ directly — no actor runtime, no client/server split.
 
 ## Sidecar process
 
-- Every VM runs inside a **shared sidecar process**, not its own process.
-- All VMs default to a single process-global sidecar (the `default` pool); each
-  extra VM adds only a V8 isolate + its kernel state.
-- This keeps per-VM memory in the tens of MB and warm creation in single-digit
-  ms (see [Performance](/agentos/docs/performance)).
+- Every VM created with `AgentOs.create()` gets a **dedicated sidecar OS
+  process** by default. Disposing the VM also destroys that process.
+- This process boundary prevents mutually untrusted V8 isolates from sharing an
+  address space. A V8 isolate alone is not a Spectre security boundary.
 - Automatic for `agentOS()`, `AgentOs.create()`, and Rivet Actors.
-- Disposing a VM tears down only that VM; the sidecar is reused for the host
-  process lifetime.
-- Advanced: the direct VM API exposes explicit sidecar handles to isolate a
-  group of VMs in their own process.
+- Advanced: the direct VM API exposes explicit shared pools and sidecar handles
+  for lower startup and memory overhead. Treat every VM on one shared handle as
+  the **same trust domain**; do not mix mutually untrusted tenants in it.
+- See [Performance](/agentos/docs/performance) for benchmarks that explicitly
+  opt into shared placement when measuring marginal VM cost.
 
 <CodeSnippet file="examples/core/advanced.ts" title="advanced.ts" />
 

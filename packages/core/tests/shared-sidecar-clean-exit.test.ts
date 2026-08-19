@@ -19,14 +19,11 @@ if (distMissing) {
  * REGRESSION: a standalone script that creates a VM and calls `await
  * vm.dispose()` must let the node process exit on its own.
  *
- * `AgentOs.create()` uses the process-global SHARED sidecar pool. `vm.dispose()`
- * releases the VM lease, but the shared sidecar's child process + stdio sockets
- * used to stay referenced, keeping the event loop alive forever — every
- * one-shot quickstart script (hello-world, filesystem, cron, agent-session…)
- * hung on exit and had to be SIGINT'd. The fix unrefs the shared sidecar's
- * handles when no leases are active (re-refs on the next lease), so the loop can
- * drain. This runs the script as a real subprocess and asserts it exits by
- * itself, with no `process.exit()` escape hatch.
+ * `AgentOs.create()` owns a sidecar process and `vm.dispose()` must tear it down
+ * without leaving child-process or stdio handles referenced. This runs the
+ * script as a real subprocess and asserts it exits by itself, with no
+ * `process.exit()` escape hatch. Explicit shared pools use the same handle
+ * cleanup path when their final lease is released.
  */
 describe("shared sidecar clean exit", () => {
 	it.skipIf(distMissing)("a standalone create()+dispose() script exits on its own", () => {
@@ -50,7 +47,7 @@ describe("shared sidecar clean exit", () => {
 		// by the spawn timeout). A hang leaves signal === "SIGTERM".
 		expect(
 			result.signal,
-			`process did not exit on its own within 60s — the shared sidecar kept the event loop alive.\n${diag}`,
+			`process did not exit on its own within 60s — the sidecar kept the event loop alive.\n${diag}`,
 		).toBeNull();
 		expect(result.status, `non-zero exit.\n${diag}`).toBe(0);
 	}, 90_000);

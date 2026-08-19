@@ -52,11 +52,12 @@ pub struct AgentOsConfig {
     pub bindings: Vec<Bindings>,
     /// Rust-only sidecar callback handler for `js_bridge`-style plugin requests.
     pub sidecar_js_bridge_callback: Option<SidecarJsBridgeCallback>,
-    /// Permission policy. Default: allow-all.
+    /// Permission policy. Defaults to VM-local execution access with network denied.
     pub permissions: Option<Permissions>,
     /// Operator-tunable VM limits. Default: sidecar/kernel built-ins.
     pub limits: Option<AgentOsLimits>,
-    /// Sidecar placement/config. Default: shared `default` pool.
+    /// Sidecar placement/config. By default, the VM owns a dedicated sidecar process.
+    /// Shared pools and explicit handles are same-trust-domain optimizations.
     pub sidecar: Option<AgentOsSidecarConfig>,
     /// Absolute path to the `agentos-sidecar` binary, resolved from the npm
     /// package on the TypeScript side. Threaded to `SidecarProcess::spawn`
@@ -760,7 +761,7 @@ pub struct ProcessLimits {
 // Permissions tree (runtime.ts)
 // ---------------------------------------------------------------------------
 
-/// Top-level permission policy. All domains optional (`allowAll` when omitted).
+/// Top-level permission policy. Omitted domains retain the secure client baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Permissions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -973,7 +974,8 @@ pub struct OverlayMountConfig {
 
 /// How the client obtains its sidecar handle.
 pub enum AgentOsSidecarConfig {
-    /// Use (or create) a shared pooled sidecar (`pool` default `"default"`).
+    /// Use (or create) a shared pooled sidecar (`pool` default `"default"`). Only VMs in the same
+    /// trust domain may share a pool.
     Shared { pool: Option<String> },
     /// Use an explicit sidecar handle.
     Explicit {

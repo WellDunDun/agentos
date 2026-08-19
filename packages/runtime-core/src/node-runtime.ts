@@ -175,8 +175,9 @@ export interface NodeRuntimeCreateOptions {
 	wasmCommandDirs?: string[];
 	/**
 	 * Existing native sidecar process to use for this runtime. Omit this to use
-	 * the default shared sidecar behavior. When provided, the runtime owns only
-	 * its VM and leaves sidecar process disposal to the caller.
+	 * a dedicated sidecar process owned by this runtime. When provided, the
+	 * runtime owns only its VM and leaves sidecar process disposal to the caller;
+	 * only pass a process shared by VMs in the same trust domain.
 	 */
 	sidecar?: SidecarProcess;
 	/** Receives coarse boot phase timings for benchmarks and diagnostics. */

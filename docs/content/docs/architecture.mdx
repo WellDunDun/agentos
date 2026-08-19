@@ -55,7 +55,7 @@ A running agentOS system has three roles: your **app** (the client), your **serv
   </g>
 </svg>
 
-The client speaks to the agentOS server over the wire. The server runs the **sidecar**, the trusted core that hosts every VM: it owns each VM's kernel and brokers every guest syscall the agent makes (filesystem, processes, network, permissions) before carrying it out. Each VM is a fully isolated world, so agents are isolated from one another and from your host.
+The client speaks to the agentOS server over the wire. The server runs the **sidecar**, the trusted core that hosts a VM: it owns the VM's kernel and brokers every guest syscall the agent makes (filesystem, processes, network, permissions) before carrying it out. Direct `AgentOs.create()` calls use one sidecar OS process per VM by default. Explicit shared placement can host multiple same-trust-domain VMs in one process.
 
 ### Your app (the client)
 
@@ -68,12 +68,12 @@ The client speaks to the agentOS server over the wire. The server runs the **sid
 
 - **The trusted core.** The sidecar is the part of the system that owns everything: the kernel, the virtual filesystem, the process and socket tables, pipes, PTYs, the permission policy, and DNS.
 - **The enforcement point.** Every request the VM makes is serviced here. The sidecar decides what is allowed before carrying it out.
-- **Hosts every VM.** A single sidecar manages many VMs side by side, each with its own kernel, filesystem, and process table, so every agent runs in its own isolated world. A crash or runaway in one VM never affects another.
+- **Hosts one trust domain.** Default placement gives each VM a dedicated sidecar process. Explicit shared placement can manage many VMs side by side for performance, but all V8 isolates in that process must belong to the same trust domain.
 
 ### The VM
 
 - **A fully virtualized Linux environment.** Each VM has its own filesystem, process table, and network policy. Two VMs share nothing.
-- **The unit of isolation.** Put one tenant or one task per VM to control the blast radius. A crash or runaway in one VM never affects another.
+- **The unit of logical isolation.** Put one tenant or one task per VM to control the blast radius; keep the default dedicated sidecar placement when tenants do not trust one another.
 - **Where guest code lives.** The agent, the shell, npm packages, and any generated code all run inside the VM, behind the kernel's boundary.
 
 ## Anatomy of a Linux VM

@@ -15,6 +15,7 @@ const vm = await AgentOs.create({
   defaultSoftware: true,
   // Ports exempt from SSRF checks (for testing against host-side mock servers)
   loopbackExemptPorts: [3000],
-  // Sidecar placement — defaults to the shared `default` pool
+  // Explicitly share one sidecar only among VMs in the same trust domain.
+  // Omit this option to use a dedicated process for the VM.
   sidecar: { kind: "shared" },
 });

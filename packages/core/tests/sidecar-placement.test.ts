@@ -1,8 +1,8 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { AgentOs } from "../src/index.js";
 
 describe("AgentOs sidecar placement", () => {
-	test("reuses shared sidecar handles and defaults AgentOs.create() to the shared pool", async () => {
+	test("reuses explicit shared pools but defaults each VM to its own sidecar", async () => {
 		const shared = await AgentOs.getSharedSidecar();
 		const sameShared = await AgentOs.getSharedSidecar();
 		const otherPool = await AgentOs.getSharedSidecar({ pool: "integration" });
@@ -10,20 +10,29 @@ describe("AgentOs sidecar placement", () => {
 		expect(otherPool).not.toBe(shared);
 
 		const vm = await AgentOs.create();
+		const secondVm = await AgentOs.create();
+		const isolatedSidecar = vm.sidecar;
+		const secondIsolatedSidecar = secondVm.sidecar;
 		try {
-			expect(vm.sidecar).toBe(shared);
+			expect(vm.sidecar).not.toBe(shared);
+			expect(secondVm.sidecar).not.toBe(vm.sidecar);
+			expect(secondVm.sidecar.describe().sidecarId).not.toBe(
+				vm.sidecar.describe().sidecarId,
+			);
 			expect(vm.sidecar.describe()).toMatchObject({
-				placement: { kind: "shared", pool: "default" },
+				placement: { kind: "explicit" },
 				state: "ready",
 				activeVmCount: 1,
 			});
 			expect("kernel" in vm).toBe(false);
 			expect((vm as Record<string, unknown>).kernel).toBeUndefined();
 		} finally {
-			await vm.dispose();
+			await Promise.all([vm.dispose(), secondVm.dispose()]);
 			await otherPool.dispose();
 			await shared.dispose();
 		}
+		expect(isolatedSidecar.describe().state).toBe("disposed");
+		expect(secondIsolatedSidecar.describe().state).toBe("disposed");
 	});
 
 	test("accepts explicit sidecar handle injection", async () => {
@@ -78,6 +87,33 @@ describe("AgentOs sidecar placement", () => {
 			});
 		} finally {
 			await vm.dispose();
+			await sidecar.dispose();
+		}
+	});
+
+	test("warns when a sidecar hosts multiple VMs in one trust domain", async () => {
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const sidecar = await AgentOs.createSidecar();
+		const vms: AgentOs[] = [];
+
+		try {
+			vms.push(
+				await AgentOs.create({
+					sidecar: { kind: "explicit", handle: sidecar },
+				}),
+			);
+			vms.push(
+				await AgentOs.create({
+					sidecar: { kind: "explicit", handle: sidecar },
+				}),
+			);
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning).toHaveBeenCalledWith(
+				expect.stringContaining("WARN_AGENTOS_SHARED_V8_TRUST_DOMAIN"),
+			);
+		} finally {
+			warning.mockRestore();
+			await Promise.all(vms.map((vm) => vm.dispose()));
 			await sidecar.dispose();
 		}
 	});

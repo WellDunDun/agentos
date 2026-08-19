@@ -1,6 +1,5 @@
-//! Shared-sidecar pooling e2e against a real sidecar. Verifies that two VMs created with the default
-//! (shared "default" pool) config reuse a single sidecar process, report a shared `active_vm_count`,
-//! stay isolated, and release independently. No V8/WASM required.
+//! Sidecar placement e2e against a real sidecar. Verifies that default VMs use distinct processes
+//! while an explicit shared pool reuses one process. No V8/WASM required.
 
 mod common;
 
@@ -12,9 +11,9 @@ async fn shared_sidecar_pooling_reuses_one_process() {
         return;
     }
 
-    // Default config => shared "default" pool, so both VMs land on one sidecar process.
-    let a = common::new_vm().await;
-    let b = common::new_vm().await;
+    // Shared placement is an explicit same-trust-domain optimization.
+    let a = common::new_vm_with_sidecar_pool("sidecar-placement").await;
+    let b = common::new_vm_with_sidecar_pool("sidecar-placement").await;
 
     let desc_a = a.sidecar().describe();
     let desc_b = b.sidecar().describe();
@@ -46,5 +45,27 @@ async fn shared_sidecar_pooling_reuses_one_process() {
     );
     assert_eq!(b.read_file("/tmp/who").await.expect("B still live"), b"B");
 
+    b.shutdown().await.expect("shutdown B");
+}
+
+#[tokio::test]
+async fn default_sidecar_placement_uses_distinct_processes() {
+    if !common::require_sidecar("default_sidecar_placement_uses_distinct_processes") {
+        return;
+    }
+
+    let a = common::new_vm().await;
+    let b = common::new_vm().await;
+
+    let desc_a = a.sidecar().describe();
+    let desc_b = b.sidecar().describe();
+    assert_ne!(
+        desc_a.sidecar_id, desc_b.sidecar_id,
+        "default VMs must not share a sidecar process"
+    );
+    assert_eq!(desc_a.active_vm_count, 1);
+    assert_eq!(desc_b.active_vm_count, 1);
+
+    a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
 }

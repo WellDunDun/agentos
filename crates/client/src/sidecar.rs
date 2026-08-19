@@ -4,7 +4,7 @@
 //! Ported from `packages/core/src/agent-os.ts` (`AgentOsSidecar`). The shared-sidecar pool is a
 //! process-global map (default pool `"default"`).
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
@@ -113,6 +113,8 @@ pub struct AgentOsSidecar {
     pub(crate) shared_pool: Option<String>,
     pub(crate) state: AtomicU8,
     pub(crate) active_vm_count: AtomicU32,
+    /// True after warning that multiple VMs share this process trust domain.
+    pub(crate) shared_trust_domain_warning_emitted: AtomicBool,
     /// Absolute path to the `agentos-sidecar` binary, threaded from `AgentOsConfig` when present.
     /// Otherwise `ensure_connection` resolves the Agent OS env fallback and passes an explicit path
     /// to the generic transport.
@@ -136,6 +138,7 @@ impl AgentOsSidecar {
             shared_pool,
             state: AtomicU8::new(SidecarState::Ready.as_u8()),
             active_vm_count: AtomicU32::new(0),
+            shared_trust_domain_warning_emitted: AtomicBool::new(false),
             sidecar_binary_path,
             connection: tokio::sync::Mutex::new(None),
         }
@@ -364,6 +367,23 @@ fn shared_sidecar_pool_limit_error() -> ClientError {
 }
 
 impl AgentOs {
+    pub(crate) fn create_sidecar_internal(
+        sidecar_id: Option<String>,
+        sidecar_binary_path: Option<String>,
+    ) -> Arc<AgentOsSidecar> {
+        let sidecar_id =
+            sidecar_id.unwrap_or_else(|| format!("agentos-sidecar-{}", Uuid::new_v4()));
+        let placement = AgentOsSidecarPlacement::Explicit {
+            sidecar_id: sidecar_id.clone(),
+        };
+        Arc::new(AgentOsSidecar::new(
+            sidecar_id,
+            placement,
+            None,
+            sidecar_binary_path,
+        ))
+    }
+
     /// Create an explicit sidecar handle. `sidecar_id` defaults to `agentos-sidecar-<uuid>`.
     ///
     /// Parity with TypeScript `createAgentOsSidecarInternal`: the explicit handle carries an
@@ -371,14 +391,7 @@ impl AgentOs {
     pub async fn create_sidecar(
         sidecar_id: Option<String>,
     ) -> Result<Arc<AgentOsSidecar>, ClientError> {
-        let sidecar_id =
-            sidecar_id.unwrap_or_else(|| format!("agentos-sidecar-{}", Uuid::new_v4()));
-        let placement = AgentOsSidecarPlacement::Explicit {
-            sidecar_id: sidecar_id.clone(),
-        };
-        Ok(Arc::new(AgentOsSidecar::new(
-            sidecar_id, placement, None, None,
-        )))
+        Ok(AgentOs::create_sidecar_internal(sidecar_id, None))
     }
 
     /// Get (or create) a pooled shared sidecar. Pool defaults to `"default"`. Uses the process-global

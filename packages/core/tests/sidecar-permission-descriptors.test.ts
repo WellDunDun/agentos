@@ -1,8 +1,27 @@
 import { describe, expect, test } from "vitest";
 import type { Permissions } from "../src/runtime-compat.js";
-import { serializePermissionsForSidecar } from "../src/sidecar/permissions.js";
+import {
+	resolveAgentOsPermissions,
+	serializePermissionsForSidecar,
+} from "../src/sidecar/permissions.js";
 
 describe("serializePermissionsForSidecar", () => {
+	test("resolves omission to a network-denied execution baseline", () => {
+		expect(resolveAgentOsPermissions()).toEqual({
+			fs: "allow",
+			network: "deny",
+			childProcess: "allow",
+			process: "allow",
+			env: "allow",
+			binding: "allow",
+		});
+		expect(resolveAgentOsPermissions({ network: "allow" })).toMatchObject({
+			fs: "allow",
+			network: "allow",
+			childProcess: "allow",
+		});
+	});
+
 	test("uses deny-all policy when permissions are omitted", () => {
 		expect(serializePermissionsForSidecar()).toEqual({
 			fs: "deny",

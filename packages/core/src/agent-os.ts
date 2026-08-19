@@ -446,7 +446,10 @@ import {
 	encodeAcpCallbackResponse,
 	encodeAcpRequest,
 } from "./sidecar/agentos-protocol.js";
-import { serializePermissionsForSidecar } from "./sidecar/permissions.js";
+import {
+	resolveAgentOsPermissions,
+	serializePermissionsForSidecar,
+} from "./sidecar/permissions.js";
 import {
 	type AgentOsSidecarClient,
 	type AgentOsSidecarPlacement,
@@ -470,6 +473,11 @@ import {
 } from "./sidecar/rpc-client.js";
 
 export interface AgentOsSharedSidecarOptions {
+	/**
+	 * Shared pools are a same-trust-domain performance optimization. VMs in the
+	 * same pool execute in one OS process and must not belong to mutually
+	 * distrusting tenants.
+	 */
 	pool?: string;
 }
 
@@ -845,12 +853,15 @@ export interface AgentOsOptions {
 	bindings?: Bindings[];
 	/**
 	 * Custom permission policy for the kernel. Controls access to filesystem,
-	 * network, child process, and environment operations. Defaults to allowAll.
+	 * network, child process, and environment operations. Defaults to virtualized
+	 * execution access with network denied; caller fields override that baseline.
 	 */
 	permissions?: Permissions;
 	/**
-	 * Sidecar placement for the VM. Defaults to the shared `default` pool.
-	 * Pass an explicit sidecar handle to pin the VM to a caller-managed sidecar.
+	 * Sidecar placement for the VM. By default, the VM owns a fresh sidecar OS
+	 * process that is destroyed with it. Shared pools and explicit handles are
+	 * same-trust-domain performance optimizations: every VM leased from one
+	 * handle shares a process and V8 address space.
 	 */
 	sidecar?: AgentOsSidecarConfig;
 	/**
@@ -3200,9 +3211,19 @@ export class AgentOs {
 
 		// Resolve the sidecar handle before starting an external sandbox so option
 		// validation failures cannot leak provider resources.
-		const sidecar = resolveAgentOsSidecar(options?.sidecar);
+		// Process isolation is the default security boundary for mutually untrusted
+		// V8 guests. A caller must explicitly opt into sharing, at which point all
+		// VMs on that handle are one trust domain.
+		const requestedSidecar = options?.sidecar;
+		const ownsSidecar = requestedSidecar === undefined;
+		const sidecar = requestedSidecar
+			? resolveAgentOsSidecar(requestedSidecar)
+			: createAgentOsSidecarInternal();
 		options = await resolveSandboxOptions(options);
 		const sandboxDisposeHooks = getSandboxDisposeHooks(options);
+		const disposeHooks = ownsSidecar
+			? [...sandboxDisposeHooks, () => sidecar.dispose()]
+			: sandboxDisposeHooks;
 		const bindings = options.bindings;
 
 		const createVmAdmin = async (): Promise<AgentOsVmAdmin> => {
@@ -3251,10 +3272,7 @@ export class AgentOs {
 				client = shared.client;
 				const session = shared.session;
 				nativeSession = session;
-				const hostPermissions = options?.permissions ?? {
-					...allowAll,
-					binding: "allow",
-				};
+				const hostPermissions = resolveAgentOsPermissions(options?.permissions);
 				const sidecarPermissions =
 					serializePermissionsForSidecar(hostPermissions);
 				const createVmConfig: CreateVmConfig = {
@@ -3466,7 +3484,7 @@ export class AgentOs {
 			vm._bindings = vmAdmin.bindings;
 			vm._bindingReference = vmAdmin.bindingReference;
 			vm._permissions = vmAdmin.permissions;
-			vm._disposeHooks.push(...sandboxDisposeHooks);
+			vm._disposeHooks.push(...disposeHooks);
 			vm._installSidecarRequestHandler();
 			vm._cronManager = new CronManager(
 				vm,
@@ -3481,11 +3499,11 @@ export class AgentOs {
 			} catch (disposeError) {
 				cleanupErrors.push(disposeError);
 			}
-			const sandboxCleanupResults = await Promise.allSettled(
-				sandboxDisposeHooks.map((hook) => hook()),
+			const cleanupResults = await Promise.allSettled(
+				disposeHooks.map((hook) => hook()),
 			);
 			cleanupErrors.push(
-				...sandboxCleanupResults.flatMap((result) =>
+				...cleanupResults.flatMap((result) =>
 					result.status === "rejected" ? [result.reason] : [],
 				),
 			);
@@ -6861,13 +6879,9 @@ export function getAgentOsKernel(vm: AgentOs): Kernel {
 	return getAgentOsRuntimeAdmin(vm).kernel;
 }
 
-function resolveAgentOsSidecar(
-	config: AgentOsSidecarConfig | undefined,
-): AgentOsSidecar {
-	if (!config || config.kind === "shared") {
-		return getSharedAgentOsSidecarInternal(
-			config?.kind === "shared" ? { pool: config.pool } : undefined,
-		);
+function resolveAgentOsSidecar(config: AgentOsSidecarConfig): AgentOsSidecar {
+	if (config.kind === "shared") {
+		return getSharedAgentOsSidecarInternal({ pool: config.pool });
 	}
 
 	return config.handle;
@@ -6921,6 +6935,8 @@ interface AgentOsSidecarState {
 	 * other — Node ref/unref is not itself counted.
 	 */
 	eventLoopHolds?: number;
+	/** True after warning that multiple VMs share this process trust domain. */
+	sharedTrustDomainWarningEmitted?: boolean;
 }
 
 const sidecarStates = new WeakMap<AgentOsSidecar, AgentOsSidecarState>();
@@ -7293,6 +7309,12 @@ async function leaseAgentOsSidecarVm<TVmAdmin extends InProcessSidecarVmAdmin>(
 		};
 		state.activeLeases.add(leaseRecord);
 		state.description.activeVmCount = state.activeLeases.size;
+		if (state.activeLeases.size > 1 && !state.sharedTrustDomainWarningEmitted) {
+			state.sharedTrustDomainWarningEmitted = true;
+			console.warn(
+				`WARN_AGENTOS_SHARED_V8_TRUST_DOMAIN: sidecar ${state.description.sidecarId} is hosting multiple VMs in one OS process and V8 address space; use separate sidecars for mutually untrusted tenants`,
+			);
+		}
 		return lease;
 	} catch (error) {
 		await client.dispose().catch(() => {});

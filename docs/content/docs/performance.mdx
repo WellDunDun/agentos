@@ -185,9 +185,10 @@ JSON → stdout; human-readable table + progress → stderr.
 
 - Each benchmark **creates the sidecar once** (`AgentOs.createSidecar()`) and
   leases all VMs from it — VMs are incremental tenants of one shared process, so
-  figures measure the marginal cost of a VM, not a fresh process.
-  (`AgentOs.create()` with no `sidecar` option already uses the shared
-  `default`-pool sidecar — the default everywhere, including RivetKit actors.)
+  figures measure the marginal cost of a same-trust-domain VM, not a fresh
+  process. `AgentOs.create()` with no `sidecar` option deliberately uses a fresh
+  process per VM; benchmark code opts into sharing to measure the lower-level
+  incremental runtime cost.
 - Before any measured iteration, a **cold run** (throwaway VM, created, started,
   snapshotted for cold start) pays one-time spawn + bootstrap, so numbers
   reflect warm steady-state per-VM cost.
