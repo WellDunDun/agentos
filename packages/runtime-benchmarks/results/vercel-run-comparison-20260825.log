@@ -1,0 +1,49 @@
+=== Vercel Run vs agentOS JavaScript benchmark ===
+Node: v24.18.0
+Iterations: 30; heavy: 12
+Collecting isolated cold-start samples...
+(node:3402620) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3402715) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3402876) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3402973) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3403035) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3403104) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3403232) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+Collecting isolated RSS samples...
+(node:3404688) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3402579) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+Measuring noop...
+Measuring source-128k...
+Measuring result-64k...
+Measuring integer-loop-1m...
+Measuring array-sort-100k...
+Measuring json-roundtrip-5k...
+Measuring regex-scan-300k...
+Measuring host-call-single...
+Measuring host-call-10x...
+Measuring host-call-32k-roundtrip...
+Measuring host-call-async-5ms...
+Measuring parallel scaling...
+
+scenario                     node-v8    run-qjs  agent-fresh agent-retained
+---------------------------- --------- --------- ----------- --------------
+noop                           0.35 ms   5.30 ms    12.53 ms        2.82 ms
+source-128k                    0.35 ms   7.58 ms    13.38 ms        3.34 ms
+result-64k                     0.29 ms  48.94 ms    12.87 ms        3.24 ms
+integer-loop-1m                1.85 ms 103.09 ms    14.20 ms        4.76 ms
+array-sort-100k                5.00 ms 115.31 ms    18.76 ms        8.35 ms
+json-roundtrip-5k              1.68 ms  24.82 ms    15.88 ms        5.37 ms
+regex-scan-300k                1.28 ms  22.63 ms    14.54 ms        5.12 ms
+host-call-single                   n/a   5.68 ms    13.44 ms        4.04 ms
+host-call-10x                      n/a   7.25 ms    15.76 ms        4.53 ms
+host-call-32k-roundtrip            n/a  52.08 ms    14.10 ms        4.74 ms
+host-call-async-5ms                n/a  10.20 ms    19.02 ms        9.91 ms

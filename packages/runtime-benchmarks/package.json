@@ -10,11 +10,14 @@
 		"bench:gate": "tsx src/quick-gate.ts",
 		"bench:memory": "node --expose-gc --import tsx/esm memory.bench.ts",
 		"bench:matrix": "tsx src/run-all.ts",
+		"bench:vercel-run": "node --expose-gc --import tsx src/comparisons/vercel-run.bench.ts",
 		"check-types": "pnpm --dir ../runtime-core build && tsc --noEmit"
 	},
 	"dependencies": {
 		"@rivet-dev/agentos": "workspace:*",
-		"@rivet-dev/agentos-runtime-core": "workspace:*"
+		"@rivet-dev/agentos-runtime-core": "workspace:*",
+		"run": "2.0.1",
+		"zod": "^4.1.11"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.2",

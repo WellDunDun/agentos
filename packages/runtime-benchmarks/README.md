@@ -115,6 +115,22 @@ The CI baseline is environment-specific because GitHub-hosted runner hardware di
 
 The latency matrix gives each guest-backed benchmark op a dedicated sidecar and VM by default. Host-only lanes (`native`, `node`, and `hostCmd`) run before that VM is created; guest-backed lanes (`guest`, `wasm`, and `vmCmd`) run inside the op's VM, which is disposed before the next op.
 
+### Vercel Run comparison
+
+The Vercel Run comparison measures the public `run` API against agentOS
+JavaScript evaluation. It includes cold start, fresh and retained execution,
+pure JavaScript workloads, host-binding calls, payload scaling, concurrency,
+and process-tree RSS. The in-process Node/V8 lane is a control, not a
+security-equivalent runtime.
+
+```bash
+pnpm --silent --dir packages/runtime-benchmarks bench:vercel-run \
+  > packages/runtime-benchmarks/results/vercel-run-comparison.json
+```
+
+Tune sample counts with `BENCH_ITERATIONS`, `BENCH_HEAVY_ITERATIONS`,
+`BENCH_COLD_ITERATIONS`, `BENCH_CONCURRENCY_ITERATIONS`, and `BENCH_WARMUP`.
+
 Each row also reports peak memory where the lane can be measured. Guest-backed lanes (`guest`, `wasm`, and `vmCmd`) use Linux `/proc/<sidecarPid>/clear_refs=5`, then subtract baseline `VmRSS` from post-lane `VmHWM` so the value is above the prewarmed-sidecar baseline. Native and default host Node lanes spawn the measured child directly and sample `/proc/<pid>/status` `VmHWM`, minus a startup no-op baseline (`native-baseline cpu_loop --iters 1 --warmup 0` and `node -e ""`), floored to one page. Non-Linux runs print one reason and render memory columns as `-`.
 
 Warmup contract:
