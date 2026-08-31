@@ -493,6 +493,27 @@ impl ResourceAccountant {
         self.check_open_fds(snapshot, additional_fds)
     }
 
+    /// Check only the open-FD resource when the caller already owns the FD
+    /// table lock. This preserves the same bound and warning gauge without
+    /// taking an unrelated full process/pipe/PTY/socket census on every open.
+    pub fn check_fd_allocation_count(
+        &self,
+        open_fds: usize,
+        additional_fds: usize,
+    ) -> Result<(), ResourceError> {
+        if let Some(gauge) = &self.gauges.open_fds {
+            gauge.observe_depth(open_fds);
+        }
+        if let Some(limit) = self.limits.max_open_fds {
+            if open_fds.saturating_add(additional_fds) > limit {
+                return Err(ResourceError::file_table_full(
+                    "maximum open file descriptor limit reached",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn max_readdir_entries(&self) -> Option<usize> {
         self.limits.max_readdir_entries
     }

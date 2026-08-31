@@ -919,6 +919,24 @@ fn build_os_config<'s>(
 /// thread so module source can be read directly, skipping the round-trip. It is
 /// confined to the same mounts the guest sees (the impl keeps the reader's
 /// `openat2(RESOLVE_BENEATH)` confinement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestModuleResolveMode {
+    Require,
+    Import,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestLoadedModule {
+    pub format: String,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestResolvedModule {
+    pub resolved: String,
+    pub loaded: GuestLoadedModule,
+}
+
 pub trait GuestModuleReader: Send {
     /// Read the source for an already-resolved guest module path, or `None` if
     /// the path isn't served by this reader (caller falls back to the bridge IPC).
@@ -932,6 +950,25 @@ pub trait GuestModuleReader: Send {
         let _ = (specifier, referrer);
         None
     }
+
+    /// Resolve and load one CommonJS-loader request on the V8 session thread.
+    /// Readers should return `None` for paths outside their immutable mount so
+    /// mutable kernel-backed files retain the normal bridge enforcement path.
+    fn resolve_loaded_module(
+        &mut self,
+        specifier: &str,
+        referrer: &str,
+        mode: GuestModuleResolveMode,
+    ) -> Option<GuestResolvedModule> {
+        let _ = (specifier, referrer, mode);
+        None
+    }
+
+    /// Load an already-resolved module from the reader's immutable mount.
+    fn load_module(&mut self, resolved_guest_path: &str) -> Option<GuestLoadedModule> {
+        let _ = resolved_guest_path;
+        None
+    }
 }
 
 /// Install (or clear) the direct module reader for the current session thread.
@@ -940,6 +977,41 @@ pub trait GuestModuleReader: Send {
 /// session/isolate thread.
 pub fn install_session_guest_reader(reader: Option<Box<dyn GuestModuleReader>>) {
     SESSION_GUEST_READER.with(|cell| *cell.borrow_mut() = reader);
+}
+
+fn with_session_guest_reader<T>(
+    operation: impl FnOnce(&mut dyn GuestModuleReader) -> Option<T>,
+) -> Option<T> {
+    let mut operation = Some(operation);
+    let direct = SESSION_GUEST_READER.with(|cell| {
+        let mut reader = cell.borrow_mut();
+        reader
+            .as_deref_mut()
+            .map(|reader| operation.take().expect("guest reader operation")(reader))
+    });
+    if let Some(result) = direct {
+        return result;
+    }
+
+    MODULE_RESOLVE_STATE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        state
+            .as_mut()
+            .and_then(|state| state.guest_reader.as_deref_mut())
+            .and_then(|reader| operation.take().expect("guest reader operation")(reader))
+    })
+}
+
+pub(crate) fn resolve_loaded_guest_module(
+    specifier: &str,
+    referrer: &str,
+    mode: GuestModuleResolveMode,
+) -> Option<GuestResolvedModule> {
+    with_session_guest_reader(|reader| reader.resolve_loaded_module(specifier, referrer, mode))
+}
+
+pub(crate) fn load_guest_module(resolved_guest_path: &str) -> Option<GuestLoadedModule> {
+    with_session_guest_reader(|reader| reader.load_module(resolved_guest_path))
 }
 
 struct ModuleResolveState {

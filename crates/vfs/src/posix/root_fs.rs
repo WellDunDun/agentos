@@ -379,6 +379,10 @@ impl VirtualFileSystem for RootFileSystem {
         self.overlay.lstat(path)
     }
 
+    fn lstat_exact(&self, path: &str) -> Option<VirtualStat> {
+        self.overlay.lstat_exact(path)
+    }
+
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
         self.overlay.link(old_path, new_path)
     }

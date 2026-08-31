@@ -204,7 +204,7 @@ fn permission_wrapped_filesystem_resolves_symlinks_before_permission_checks() {
 }
 
 #[test]
-fn unrestricted_filesystem_skips_permission_only_symlink_resolution() {
+fn unrestricted_filesystem_skips_permission_callback_and_symlink_resolution() {
     let mut inner = MemoryFileSystem::new();
     inner.mkdir("/workspace", true).expect("seed workspace dir");
     inner.mkdir("/private", true).expect("seed private dir");
@@ -241,13 +241,18 @@ fn unrestricted_filesystem_skips_permission_only_symlink_resolution() {
             .lock()
             .expect("permission path lock poisoned")
             .as_slice(),
-        [String::from("/workspace/alias.txt")].as_slice()
+        &[] as &[String]
     );
 
     let error = filesystem
         .read_file("/workspace/missing.txt")
         .expect_err("the underlying filesystem must still reject missing paths");
     assert_eq!(error.code(), "ENOENT");
+
+    let error = filesystem
+        .read_file("/workspace/invalid\0path")
+        .expect_err("unrestricted access must still validate paths");
+    assert_eq!(error.code(), "EINVAL");
 }
 
 #[test]

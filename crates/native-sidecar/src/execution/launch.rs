@@ -145,7 +145,7 @@ fn resolve_command_execution(
                 build_host_node_cli_eval(&cli),
             );
             prepare_guest_runtime_env(vm, &mut env, &guest_cwd, &host_cwd, None)?;
-            add_runtime_guest_path_mapping(&mut env, &cli.guest_root, &cli.package_root);
+            add_read_only_runtime_guest_path_mapping(&mut env, &cli.guest_root, &cli.package_root);
             add_runtime_host_access_path(
                 &mut env,
                 "AGENTOS_EXTRA_FS_READ_PATHS",
@@ -3256,6 +3256,30 @@ pub(super) fn build_module_reader(
                 .map(|host_path| (normalize_path(&mount.guest_path), PathBuf::from(host_path)))
         })
         .collect();
+    // Runtime-owned immutable mappings (notably the host npm distribution)
+    // are not VM mount declarations, but they carry the same trusted
+    // read-only bit in the launch environment. Feed them into the identical
+    // resolve-beneath reader instead of sending every module lookup through
+    // the service-loop kernel path.
+    pairs.extend(
+        resolved
+            .env
+            .get("AGENTOS_GUEST_PATH_MAPPINGS")
+            .and_then(|value| serde_json::from_str::<Vec<RuntimeGuestPathMapping>>(value).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|mapping| mapping.read_only)
+            .filter(|mapping| {
+                Path::new(&mapping.guest_path).is_absolute()
+                    && Path::new(&mapping.host_path).is_absolute()
+            })
+            .map(|mapping| {
+                (
+                    normalize_path(&mapping.guest_path),
+                    PathBuf::from(mapping.host_path),
+                )
+            }),
+    );
 
     // Packed package-version leaves: module resolution reads packed
     // `node_modules` content straight from the `.aospkg` mount index (shared
@@ -4156,6 +4180,23 @@ pub(super) fn add_runtime_guest_path_mapping(
     guest_path: &str,
     host_path: &Path,
 ) {
+    add_runtime_guest_path_mapping_with_access(env, guest_path, host_path, false);
+}
+
+pub(super) fn add_read_only_runtime_guest_path_mapping(
+    env: &mut BTreeMap<String, String>,
+    guest_path: &str,
+    host_path: &Path,
+) {
+    add_runtime_guest_path_mapping_with_access(env, guest_path, host_path, true);
+}
+
+fn add_runtime_guest_path_mapping_with_access(
+    env: &mut BTreeMap<String, String>,
+    guest_path: &str,
+    host_path: &Path,
+    read_only: bool,
+) {
     let mut mappings = env
         .get("AGENTOS_GUEST_PATH_MAPPINGS")
         .and_then(|value| serde_json::from_str::<Vec<Value>>(value).ok())
@@ -4170,6 +4211,7 @@ pub(super) fn add_runtime_guest_path_mapping(
     mappings.push(json!({
         "guestPath": normalize_path(guest_path),
         "hostPath": host_path.display().to_string(),
+        "readOnly": read_only,
     }));
     if let Ok(serialized) = serde_json::to_string(&mappings) {
         env.insert(String::from("AGENTOS_GUEST_PATH_MAPPINGS"), serialized);

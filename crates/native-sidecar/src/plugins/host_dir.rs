@@ -10,7 +10,8 @@ use nix::libc;
 // the portable anchor open mode.
 const O_PATH_ANCHOR: OFlag = OFlag::O_RDONLY;
 use agentos_execution::{
-    GuestModuleReader, LocalModuleResolutionCache, ModuleFsReader, ModuleResolveMode,
+    GuestLoadedModule, GuestModuleReader, GuestModuleResolveMode, GuestResolvedModule,
+    LocalModuleResolutionCache, LocalResolvedModuleFormat, ModuleFsReader, ModuleResolveMode,
     ModuleResolver,
 };
 use agentos_kernel::mount_plugin::{
@@ -1790,6 +1791,49 @@ impl GuestModuleReader for SessionModuleReader {
         let reader: &mut dyn ModuleFsReader = &mut self.reader;
         let mut resolver = ModuleResolver::new(reader, &mut self.cache);
         resolver.resolve_module(specifier, referrer, ModuleResolveMode::Import)
+    }
+
+    fn resolve_loaded_module(
+        &mut self,
+        specifier: &str,
+        referrer: &str,
+        mode: GuestModuleResolveMode,
+    ) -> Option<GuestResolvedModule> {
+        let reader: &mut dyn ModuleFsReader = &mut self.reader;
+        let mut resolver = ModuleResolver::new(reader, &mut self.cache);
+        let mode = match mode {
+            GuestModuleResolveMode::Require => ModuleResolveMode::Require,
+            GuestModuleResolveMode::Import => ModuleResolveMode::Import,
+        };
+        let resolved = resolver.resolve_module(specifier, referrer, mode)?;
+        let format = resolver.module_format(&resolved)?;
+        let source = if format == LocalResolvedModuleFormat::Module {
+            None
+        } else {
+            Some(resolver.load_file(&resolved)?)
+        };
+        Some(GuestResolvedModule {
+            resolved,
+            loaded: GuestLoadedModule {
+                format: String::from(format.as_str()),
+                source,
+            },
+        })
+    }
+
+    fn load_module(&mut self, resolved_guest_path: &str) -> Option<GuestLoadedModule> {
+        let reader: &mut dyn ModuleFsReader = &mut self.reader;
+        let mut resolver = ModuleResolver::new(reader, &mut self.cache);
+        let format = resolver.module_format(resolved_guest_path)?;
+        let source = if format == LocalResolvedModuleFormat::Module {
+            None
+        } else {
+            Some(resolver.load_file(resolved_guest_path)?)
+        };
+        Some(GuestLoadedModule {
+            format: String::from(format.as_str()),
+            source,
+        })
     }
 }
 

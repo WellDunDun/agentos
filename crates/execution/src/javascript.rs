@@ -180,6 +180,7 @@ struct SyncBridgePhaseStats {
 
 static SYNC_BRIDGE_PHASES: OnceLock<Mutex<BTreeMap<String, SyncBridgePhaseStats>>> =
     OnceLock::new();
+static SYNC_BRIDGE_PHASE_RECORDS: AtomicU64 = AtomicU64::new(0);
 static SYNC_BRIDGE_REQUEST_ENQUEUED: OnceLock<Mutex<HashMap<u64, (String, Instant)>>> =
     OnceLock::new();
 
@@ -202,7 +203,10 @@ fn record_sync_bridge_phase(method: &str, stage: &str, elapsed: Duration) {
     entry.total_us = entry.total_us.wrapping_add(elapsed_us);
     entry.max_us = entry.max_us.max(elapsed_us);
 
-    if let Ok(path) = std::env::var("AGENTOS_SYNC_BRIDGE_PHASES_FILE") {
+    if SYNC_BRIDGE_PHASE_RECORDS.fetch_add(1, Ordering::Relaxed) % 512 == 511 {
+        let Ok(path) = std::env::var("AGENTOS_SYNC_BRIDGE_PHASES_FILE") else {
+            return;
+        };
         let mut lines = String::new();
         for (key, value) in stats.iter() {
             let Some((method, stage)) = key.split_once(':') else {
@@ -2901,7 +2905,7 @@ impl JavascriptExecutionEngine {
         // default + in-place assign: LocalBridgeState is Drop, so `..Default::default()`
         // (E0509) is not allowed.
         let mut local_bridge = LocalBridgeState::default();
-        local_bridge.runtime = Some(process_runtime);
+        local_bridge.runtime = Some(process_runtime.clone());
         local_bridge.timer_resources = Some(Arc::clone(runtime.resources()));
         local_bridge.max_timers = javascript_max_timers(&request);
         local_bridge.translator = translator;
@@ -2914,7 +2918,7 @@ impl JavascriptExecutionEngine {
             .get(FORWARD_KERNEL_STDIN_RPC_ENV)
             .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         let (events, event_bridge_task) = spawn_v8_event_bridge(
-            &runtime,
+            &process_runtime,
             frame_receiver,
             pending_sync_rpc.clone(),
             exited.clone(),
@@ -3903,7 +3907,6 @@ fn spawn_v8_event_bridge(
         TrackedLimit::JavascriptEventChannel,
         JAVASCRIPT_EVENT_CHANNEL_CAPACITY,
     );
-
     let task = runtime
         .spawn(agentos_runtime::TaskClass::Vm, async move {
             let mut emitted_exit = false;
@@ -4342,14 +4345,29 @@ impl LocalBridgeState {
                 if self.js_runtime_denies_specifier(specifier) {
                     return Some(LocalBridgeCallResult::Immediate(Value::Null));
                 }
+                let include_module = args.get(3).and_then(Value::as_bool).unwrap_or(false);
                 let resolved = self.with_module_resolver(|resolver| {
-                    resolver.resolve_module(specifier, parent, mode)
+                    let resolved = resolver.resolve_module(specifier, parent, mode)?;
+                    if !include_module {
+                        return Some(Value::String(resolved));
+                    }
+                    let format = resolver.module_format(&resolved)?;
+                    let source = if format == LocalResolvedModuleFormat::Module {
+                        Value::Null
+                    } else {
+                        Value::String(resolver.load_file(&resolved)?)
+                    };
+                    Some(json!({
+                        "resolved": resolved,
+                        "format": format.as_str(),
+                        "source": source,
+                    }))
                 });
                 if resolved.is_none() && self.has_module_reader() {
                     return None;
                 }
                 Some(LocalBridgeCallResult::Immediate(
-                    resolved.map(Value::String).unwrap_or(Value::Null),
+                    resolved.unwrap_or(Value::Null),
                 ))
             }
             "_moduleFormat" => {
@@ -4364,12 +4382,25 @@ impl LocalBridgeState {
                 ))
             }
             "_loadFile" | "_loadFileSync" => {
-                let source = self.load_file(args.first().and_then(Value::as_str).unwrap_or(""));
+                let path = args.first().and_then(Value::as_str).unwrap_or("");
+                let include_format = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                let source = self.with_module_resolver(|resolver| {
+                    if !include_format {
+                        return resolver.load_file(path).map(Value::String);
+                    }
+                    let format = resolver.module_format(path)?;
+                    let source = if format == LocalResolvedModuleFormat::Module {
+                        Value::Null
+                    } else {
+                        Value::String(resolver.load_file(path)?)
+                    };
+                    Some(json!({ "format": format.as_str(), "source": source }))
+                });
                 if source.is_none() && self.has_module_reader() {
                     return None;
                 }
                 Some(LocalBridgeCallResult::Immediate(
-                    source.map(Value::String).unwrap_or(Value::Null),
+                    source.unwrap_or(Value::Null),
                 ))
             }
             "_batchResolveModules" => {

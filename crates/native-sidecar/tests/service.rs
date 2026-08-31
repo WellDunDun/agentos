@@ -16910,13 +16910,25 @@ const contents = await Promise.all(
   )
 );
 console.log(JSON.stringify(contents));
+await Promise.all(
+  Array.from({ length: 10 }, async (_, index) => {
+    const handle = await fs.open(`/rpc/handle-${index}.txt`, "w");
+    await handle.write(`handle-${index}`);
+    await handle.close();
+  })
+);
+console.log("handles-complete");
 await new Promise(() => {});
 "#,
             );
 
             let context = create_javascript_context_for_vm_test(&sidecar, &vm_id);
             let execution = start_javascript_execution_for_vm_test(&sidecar, &vm_id, StartJavascriptExecutionRequest {
-                limits: Default::default(),
+                limits: agentos_execution::JavascriptExecutionLimits {
+                    reactor_work_quantum: Some(64),
+                    bridge_call_timeout_ms: Some(30_000),
+                    ..Default::default()
+                },
                 guest_runtime: Default::default(),
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
@@ -16965,13 +16977,20 @@ await new Promise(() => {});
                     .insert(String::from("proc-js-promises"), process);
             }
 
-            let mut saw_write_batch = false;
-            let mut saw_read_batch = false;
+            let expected_batches = [
+                "fs.promises.writeFile",
+                "fs.open",
+                "fs.close",
+                "fs.open",
+                "fs.write",
+                "fs.close",
+            ];
+            let mut completed_batch_count = 0;
             let mut saw_stdout = false;
             let mut held_exit = None;
             let mut pending_requests = Vec::new();
 
-            for _ in 0..40 {
+            for _ in 0..160 {
                 let event = {
                     let mut vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                     let process = vm
@@ -16989,7 +17008,10 @@ await new Promise(() => {});
 
                 match event {
                     ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
-                        if !request.method.starts_with("fs.promises.") {
+                        if !matches!(
+                            request.method.as_str(),
+                            "fs.promises.writeFile" | "fs.open" | "fs.write" | "fs.close"
+                        ) {
                             block_on_sidecar!(
                                 sidecar,
                                 sidecar.handle_execution_event(
@@ -17004,19 +17026,15 @@ await new Promise(() => {});
 
                         pending_requests.push(request);
 
-                        let expected_method = if !saw_write_batch {
-                            "fs.promises.writeFile"
-                        } else if !saw_read_batch {
-                            "fs.promises.readFile"
-                        } else {
-                            panic!("received unexpected extra fs.promises request batch");
-                        };
+                        let expected_method = expected_batches
+                            .get(completed_batch_count)
+                            .expect("received unexpected extra filesystem request batch");
 
                         if pending_requests.len() == 10 {
                             assert!(
                                 pending_requests
                                     .iter()
-                                    .all(|request| request.method == expected_method),
+                                    .all(|request| request.method == *expected_method),
                                 "expected batched {expected_method} requests, got {:?}",
                                 pending_requests
                                     .iter()
@@ -17036,17 +17054,15 @@ await new Promise(() => {});
                                 .expect("handle batched javascript promises rpc event");
                             }
 
-                            if !saw_write_batch {
-                                saw_write_batch = true;
-                            } else {
-                                saw_read_batch = true;
-                            }
+                            completed_batch_count += 1;
                         }
                     }
                     ActiveExecutionEvent::Stdout(chunk) => {
                         let stdout = String::from_utf8(chunk).expect("stdout utf8");
                         if stdout.contains(r#"["value-0","value-1","value-2","value-3","value-4","value-5","value-6","value-7","value-8","value-9"]"#) {
                             saw_stdout = true;
+                        }
+                        if stdout.contains("handles-complete") {
                             break;
                         }
                     }
@@ -17085,13 +17101,29 @@ await new Promise(() => {});
                     .map(|index| format!("value-{index}"))
                     .collect::<Vec<_>>()
             );
-            assert!(
-                saw_write_batch,
-                "expected Promise.all(writeFile) to issue a full batch before the first response"
+            let handle_content = {
+                let mut vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
+                (0..10)
+                    .map(|index| {
+                        String::from_utf8(
+                            vm.kernel
+                                .read_file(&format!("/rpc/handle-{index}.txt"))
+                                .expect("read FileHandle output from kernel"),
+                        )
+                        .expect("utf8 FileHandle contents")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                handle_content,
+                (0..10)
+                    .map(|index| format!("handle-{index}"))
+                    .collect::<Vec<_>>()
             );
             assert!(
-                saw_read_batch,
-                "expected Promise.all(readFile) to issue a full batch before the first response"
+                completed_batch_count == expected_batches.len(),
+                "expected writeFile and FileHandle open/write/close operations to issue full asynchronous bridge batches; completed {completed_batch_count} of {}",
+                expected_batches.len()
             );
             assert!(
                 saw_stdout || held_exit == Some(0),
@@ -25821,6 +25853,11 @@ try {
         }
 
         #[test]
+        fn javascript_fs_promises_and_file_handles_batch_async_requests_regression() {
+            run_isolated_service_test("javascript-fs-promises-async-batches");
+        }
+
+        #[test]
         fn wasm_shell_external_stdout_redirect_writes_file_regression() {
             run_isolated_service_test("wasm-shell-external-stdout-redirect");
         }
@@ -25995,6 +26032,9 @@ try {
                 }
                 "javascript-fs-promises-hot-metadata" => {
                     javascript_fs_promises_hot_metadata_ops_use_sync_semantics();
+                }
+                "javascript-fs-promises-async-batches" => {
+                    javascript_fs_promises_batch_requests_before_waiting_on_sidecar_responses();
                 }
                 "javascript-pty-raw-mode" => {
                     javascript_sync_rpc_pty_set_raw_mode_toggles_kernel_tty_discipline();

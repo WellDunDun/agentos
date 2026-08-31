@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::future::Future;
+use std::future::{poll_fn, Future};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -167,7 +167,7 @@ impl PreparedExtensionServiceCommand {
     pub(crate) async fn execute_supervised(self) -> Option<CompletedExtensionServiceCommand> {
         let PreparedExtensionServiceCommand {
             operation,
-            future,
+            mut future,
             panic_reply,
             admission,
         } = self;
@@ -217,21 +217,24 @@ impl PreparedExtensionServiceCommand {
             }
             None => (None, None),
         };
-        let mut task = tokio::task::spawn_local(future);
-        let joined = match cancellation {
+        // The command is already running inside the bounded supervisor task
+        // created by `schedule_extension_service_command`. Poll it directly
+        // here and catch panics at the future boundary instead of spawning a
+        // second local task for every process event. This preserves typed panic
+        // reporting and cancellation while removing one scheduler round trip
+        // from high-frequency filesystem RPCs.
+        let task = poll_fn(move |context| {
+            match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context))) {
+                Ok(std::task::Poll::Ready(mutation)) => std::task::Poll::Ready(Ok(mutation)),
+                Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                Err(_) => std::task::Poll::Ready(Err(())),
+            }
+        });
+        tokio::pin!(task);
+        let completed = match cancellation {
             Some(cancellation) => tokio::select! {
                 result = &mut task => result,
                 reason = cancellation.cancelled() => {
-                    task.abort();
-                    if let Err(error) = task.await {
-                        if !error.is_cancelled() {
-                            tracing::error!(
-                                operation,
-                                %error,
-                                "ERR_AGENTOS_EXTENSION_SERVICE_CANCEL_JOIN: cancelled extension service task failed while being observed"
-                            );
-                        }
-                    }
                     panic_reply(SidecarError::InvalidState(format!(
                         "ERR_AGENTOS_EXTENSION_SERVICE_CANCELLED: extension service {operation} cancelled: {reason:?}"
                     )));
@@ -240,20 +243,19 @@ impl PreparedExtensionServiceCommand {
             },
             None => task.await,
         };
-        match joined {
+        match completed {
             Ok(mutation) => Some(CompletedExtensionServiceCommand {
                 operation,
                 mutation,
                 failure_reply: panic_reply,
                 _permit: permit,
             }),
-            Err(error) => {
+            Err(()) => {
                 let failure = SidecarError::Execution(format!(
-                    "ERR_AGENTOS_EXTENSION_SERVICE_TASK_PANIC: extension service {operation} failed: {error}"
+                    "ERR_AGENTOS_EXTENSION_SERVICE_TASK_PANIC: extension service {operation} panicked"
                 ));
                 tracing::error!(
                     operation,
-                    %error,
                     "ERR_AGENTOS_EXTENSION_SERVICE_TASK_PANIC: extension service task failed"
                 );
                 panic_reply(failure);

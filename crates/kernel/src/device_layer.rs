@@ -141,6 +141,38 @@ impl<V: VirtualFileSystem> VirtualFileSystem for DeviceLayer<V> {
         self.inner.create_file_exclusive(path, content)
     }
 
+    fn create_file_exclusive_with_mode(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<()> {
+        if is_device_path(path) || is_device_dir(path) {
+            return Err(VfsError::new(
+                "EEXIST",
+                format!("device already exists: {path}"),
+            ));
+        }
+        self.inner
+            .create_file_exclusive_with_mode(path, content, mode)
+    }
+
+    fn create_file_exclusive_with_mode_stat(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        if is_device_path(path) || is_device_dir(path) {
+            return Err(VfsError::new(
+                "EEXIST",
+                format!("device already exists: {path}"),
+            ));
+        }
+        self.inner
+            .create_file_exclusive_with_mode_stat(path, content, mode)
+    }
+
     fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
         if is_sink_device_path(path)
             || self

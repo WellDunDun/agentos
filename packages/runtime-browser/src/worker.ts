@@ -2047,14 +2047,26 @@ async function initRuntime(payload: BrowserWorkerInitPayload): Promise<void> {
 		request: string,
 		fromDir: string,
 		mode?: "require" | "import",
+		includeModule?: boolean,
 	) => {
-		return syncBridge.requestNullableText("module.resolve", [
+		const resolved = syncBridge.requestNullableText("module.resolve", [
 			request,
 			fromDir,
 			mode ?? "require",
 		]);
+		if (!includeModule || resolved === null) return resolved;
+		const format = moduleFormatSync(resolved);
+		if (format === null) return null;
+		return {
+			resolved,
+			format,
+			source: format === "module" ? null : loadFileSourceSync(resolved),
+		};
 	};
-	const loadFileSync = (path: string, _mode?: "require" | "import") => {
+	const moduleFormatSync = (path: string) => {
+		return syncBridge.requestNullableText("module.format", [path]);
+	};
+	const loadFileSourceSync = (path: string) => {
 		const source = syncBridge.requestNullableText("module.loadFile", [path]);
 		if (source === null) {
 			return null;
@@ -2065,8 +2077,19 @@ async function initRuntime(payload: BrowserWorkerInitPayload): Promise<void> {
 		}
 		return transformDynamicImport(code);
 	};
-	const moduleFormatSync = (path: string) => {
-		return syncBridge.requestNullableText("module.format", [path]);
+	const loadFileSync = (
+		path: string,
+		includeFormat?: boolean,
+	): string | { format: string; source: string | null } | null => {
+		if (includeFormat) {
+			const format = moduleFormatSync(path);
+			if (format === null) return null;
+			return {
+				format,
+				source: format === "module" ? null : loadFileSourceSync(path),
+			};
+		}
+		return loadFileSourceSync(path);
 	};
 	const batchResolveModulesSync = (requests: Array<[string, string]>) => {
 		return syncBridge.requestJson("module.batchResolve", [requests]);

@@ -15,7 +15,8 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
 	{
 		name: "__agentOsRequireEsmSync",
 		classification: "hardened",
-		rationale: "V8-owned synchronous ESM loader used by Node-compatible require().",
+		rationale:
+			"V8-owned synchronous ESM loader used by Node-compatible require().",
 	},
 	{
 		name: "process.cpuUsage",
@@ -751,6 +752,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
 		rationale: "Host filesystem bridge reference.",
 	},
 	{
+		name: "_fsMkdirStatAsync",
+		classification: "hardened",
+		rationale: "Atomic mkdir-and-existing-stat bridge reference.",
+	},
+	{
 		name: "_fsRmdir",
 		classification: "hardened",
 		rationale: "Host filesystem bridge reference.",
@@ -901,9 +907,19 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
 		rationale: "Host file-descriptor open bridge reference.",
 	},
 	{
+		name: "_fsOpenAsync",
+		classification: "hardened",
+		rationale: "Asynchronous host file-descriptor open bridge reference.",
+	},
+	{
 		name: "fs.closeSync",
 		classification: "hardened",
 		rationale: "Host file-descriptor close bridge reference.",
+	},
+	{
+		name: "_fsCloseAsync",
+		classification: "hardened",
+		rationale: "Asynchronous host file-descriptor close bridge reference.",
 	},
 	{
 		name: "fs._getPathSync",
@@ -929,6 +945,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
 		name: "fs.writeSync",
 		classification: "hardened",
 		rationale: "Host file-descriptor write bridge reference.",
+	},
+	{
+		name: "_fsWriteAsync",
+		classification: "hardened",
+		rationale: "Asynchronous host file-descriptor write bridge reference.",
 	},
 	{
 		name: "_fsWriteRaw",
@@ -1212,7 +1233,8 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
 	{
 		name: "_netSocketWriteSyncRaw",
 		classification: "hardened",
-		rationale: "Host synchronous net socket write bridge reference for WASM guests.",
+		rationale:
+			"Host synchronous net socket write bridge reference for WASM guests.",
 	},
 	{
 		name: "_netSocketEndRaw",

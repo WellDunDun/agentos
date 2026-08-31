@@ -377,7 +377,7 @@ var FileHandle = class _FileHandle {
     }
     handle._closing = true;
     try {
-      fs.closeSync(handle._fd);
+      await fsCloseAsync(handle._fd);
       handle._emitCloseOnce();
     } finally {
       handle._closing = false;
@@ -459,7 +459,7 @@ var FileHandle = class _FileHandle {
       if (encoding === "hex" && buffer.length % 2 !== 0) {
         throw createInvalidArgValueError("encoding", `is invalid for data of length ${buffer.length}`);
       }
-      const bytesWritten2 = fs.writeSync(handle.fd, import_buffer.Buffer.from(buffer, encoding), 0, void 0, offsetOrPosition ?? null);
+      const bytesWritten2 = await fsWriteAsync(handle.fd, buffer, offsetOrPosition, encoding, void 0);
       return { bytesWritten: bytesWritten2, buffer };
     }
     if (!ArrayBuffer.isView(buffer)) {
@@ -467,7 +467,7 @@ var FileHandle = class _FileHandle {
     }
     const offset = offsetOrPosition ?? 0;
     const length = typeof lengthOrEncoding === "number" ? lengthOrEncoding : void 0;
-    const bytesWritten = fs.writeSync(handle.fd, buffer, offset, length, position ?? null);
+    const bytesWritten = await fsWriteAsync(handle.fd, buffer, offset, length, position ?? null);
     return { bytesWritten, buffer };
   }
   async readFile(options) {
@@ -2289,6 +2289,7 @@ var _fsAsync = {
   writeFileBinary: createBridgeAsyncFacade("_fsWriteFileBinaryAsync"),
   readDir: createBridgeAsyncFacade("_fsReadDirAsync"),
   mkdir: createBridgeAsyncFacade("_fsMkdirAsync"),
+  mkdirStat: createBridgeAsyncFacade("_fsMkdirStatAsync"),
   rmdir: createBridgeAsyncFacade("_fsRmdirAsync"),
   stat: createBridgeAsyncFacade("_fsStatAsync"),
   unlink: createBridgeAsyncFacade("_fsUnlinkAsync"),
@@ -2306,10 +2307,13 @@ var _fsAsync = {
 };
 var _fdOpen = createBridgeSyncFacade("fs.openSync");
 var _fdClose = createBridgeSyncFacade("fs.closeSync");
+var _fdOpenAsync = createBridgeAsyncFacade("_fsOpenAsync");
+var _fdCloseAsync = createBridgeAsyncFacade("_fsCloseAsync");
 var _fdRead = createBridgeSyncFacade("fs.readSync");
 var _fsReadRaw = createBridgeSyncFacade("_fsReadRaw");
 var _fsReadFileRangeRaw = createBridgeSyncFacade("_fsReadFileRangeRaw");
 var _fdWrite = createBridgeSyncFacade("fs.writeSync");
+var _fdWriteAsync = createBridgeAsyncFacade("_fsWriteAsync");
 var _fsWriteRaw = createBridgeSyncFacade("_fsWriteRaw");
 var _fsWritevRaw = createBridgeSyncFacade("_fsWritevRaw");
 var _fdFstat = createBridgeSyncFacade("fs.fstatSync");
@@ -2407,7 +2411,7 @@ async function fsReadFileAsync(path, options) {
   }
 
   const rawPath = normalizePathLike(path);
-  const handle = new FileHandle(fs.openSync(rawPath, "r"));
+  const handle = new FileHandle(await fsOpenAsync(rawPath, "r"));
   try {
     return await handle.readFile(options);
   } finally {
@@ -2457,10 +2461,32 @@ async function fsReaddirAsync(path, options) {
     throw err;
   }
 }
+const MAX_MKDIR_CALLBACK_STATS = 64;
+const mkdirCallbackLstat = /* @__PURE__ */ new Map();
 async function fsMkdirAsync(path, options) {
   const rawPath = normalizePathLike(path);
   const recursive = typeof options === "object" ? options?.recursive ?? false : false;
-  await _fsAsync.mkdir.apply(void 0, [rawPath, recursive]);
+  if (recursive) {
+    await _fsAsync.mkdir.apply(void 0, [rawPath, true]);
+  } else {
+    const rawMode = typeof options === "object" ? options?.mode : options;
+    const mode = rawMode === void 0 ? void 0 : normalizeModeArgument(rawMode);
+    const result = decodeBridgeJson(await _fsAsync.mkdirStat.apply(void 0, [
+      rawPath,
+      { recursive: false, mode }
+    ]));
+    if (!result?.created) {
+      const error = createFsError(
+        "EEXIST",
+        `EEXIST: file already exists, mkdir '${rawPath}'`,
+        "mkdir",
+        rawPath
+      );
+      error.__agentOSExistingStat = result?.stat;
+      error.__agentOSExistingPath = rawPath;
+      throw error;
+    }
+  }
   return recursive ? rawPath : void 0;
 }
 async function fsRmdirAsync(path) {
@@ -2486,6 +2512,8 @@ async function fsStatAsync(path) {
 }
 async function fsLstatAsync(path) {
   const pathStr = normalizePathLike(path);
+  const existingStat = mkdirCallbackLstat.get(pathStr);
+  if (existingStat) return new Stats(existingStat);
   const statJson = await _fsAsync.lstat.apply(void 0, [pathStr]);
   return new Stats(decodeBridgeJson(statJson));
 }
@@ -2598,6 +2626,50 @@ async function fsLutimesAsync(path, atime, mtime) {
     normalizeFsTimeSpec(atime, "atime"),
     normalizeFsTimeSpec(mtime, "mtime")
   ]);
+}
+async function fsOpenAsync(path, flags, mode) {
+  const pathStr = resolveOperationPath(path);
+  const numFlags = parseFlags(flags ?? "r");
+  const requestedMode = normalizeOpenModeArgument(mode);
+  const modeNum = numFlags & O_CREAT ? applyProcessUmask(requestedMode ?? 438) : requestedMode;
+  try {
+    return await _fdOpenAsync.apply(void 0, [pathStr, numFlags, modeNum]);
+  } catch (error) {
+    const message = error?.message ?? String(error);
+    if (message.includes("ENOENT")) throw createFsError("ENOENT", message, "open", pathStr);
+    if (message.includes("EMFILE")) throw createFsError("EMFILE", message, "open", pathStr);
+    if (bridgeErrorCode(error) === "ENXIO") throw createFsError("ENXIO", message, "open", pathStr);
+    throw error;
+  }
+}
+async function fsCloseAsync(fd) {
+  const normalizedFd = normalizeFdInteger(fd);
+  if (deferCloseIfChildInheritedFd(normalizedFd)) {
+    return;
+  }
+  try {
+    await _fdCloseAsync.apply(void 0, [normalizedFd]);
+  } catch (error) {
+    const message = error?.message ?? String(error);
+    if (message.includes("EBADF")) throw createFsError("EBADF", "EBADF: bad file descriptor, close", "close");
+    throw error;
+  }
+}
+async function fsWriteAsync(fd, buffer, offset, length, position) {
+  const normalizedFd = normalizeFdInteger(fd);
+  const normalized = normalizeWriteSyncArgs(buffer, offset, length, position);
+  const dataBytes = typeof normalized.buffer === "string" ? import_buffer.Buffer.from(normalized.buffer, normalized.encoding) : new Uint8Array(
+    normalized.buffer.buffer,
+    normalized.buffer.byteOffset + normalized.offset,
+    normalized.length
+  );
+  try {
+    return await _fdWriteAsync.apply(void 0, [normalizedFd, encodeBridgeBytes(dataBytes), normalized.position ?? null]);
+  } catch (error) {
+    const message = error?.message ?? String(error);
+    if (message.includes("EBADF")) throw createFsError("EBADF", message, "write");
+    throw error;
+  }
 }
 function encodeWritevRawPayload(buffers) {
   let totalBytes = 4;
@@ -3285,7 +3357,8 @@ var fs = {
       normalizeFsTimeSpec(mtime, "mtime")
     ]), "futimes");
   },
-  // Async methods - wrap sync methods in callbacks/promises
+  // Async methods use the sidecar's asynchronous bridge so independent
+  // filesystem work can be admitted before earlier responses complete.
   //
   // IMPORTANT: Low-level fd operations (open, close, read, write) and operations commonly
   // used by streaming libraries (stat, lstat, rename, unlink) must defer their callbacks
@@ -3327,18 +3400,12 @@ var fs = {
       options = void 0;
     }
     if (callback) {
-      normalizePathLike(path);
-      validateEncodingOption(options);
-      try {
-        fs.writeFileSync(path, data, options);
-        callback(null);
-      } catch (e) {
-        callback(e);
-      }
-    } else {
-      return Promise.resolve(
-        fs.writeFileSync(path, data, options)
+      fsWriteFileAsync(path, data, options).then(
+        () => callback(null),
+        (error) => callback(error)
       );
+    } else {
+      return fsWriteFileAsync(path, data, options);
     }
   },
   appendFile(path, data, options, callback) {
@@ -3367,17 +3434,12 @@ var fs = {
       options = void 0;
     }
     if (callback) {
-      normalizePathLike(path);
-      validateEncodingOption(options);
-      try {
-        callback(null, fs.readdirSync(path, options));
-      } catch (e) {
-        callback(e);
-      }
-    } else {
-      return Promise.resolve(
-        fs.readdirSync(path, options)
+      fsReaddirAsync(path, options).then(
+        (entries) => callback(null, entries),
+        (error) => callback(error)
       );
+    } else {
+      return fsReaddirAsync(path, options);
     }
   },
   mkdir(path, options, callback) {
@@ -3386,16 +3448,29 @@ var fs = {
       options = void 0;
     }
     if (callback) {
-      normalizePathLike(path);
-      try {
-        fs.mkdirSync(path, options);
-        callback(null);
-      } catch (e) {
-        callback(e);
-      }
+      fsMkdirAsync(path, options).then(
+        (createdPath) => callback(null, createdPath),
+        (error) => {
+          const existingPath = error?.__agentOSExistingPath;
+          const existingStat = error?.__agentOSExistingStat;
+          if (
+            typeof existingPath !== "string" ||
+            !existingStat ||
+            mkdirCallbackLstat.size >= MAX_MKDIR_CALLBACK_STATS
+          ) {
+            callback(error);
+            return;
+          }
+          mkdirCallbackLstat.set(existingPath, existingStat);
+          try {
+            callback(error);
+          } finally {
+            mkdirCallbackLstat.delete(existingPath);
+          }
+        }
+      );
     } else {
-      fs.mkdirSync(path, options);
-      return Promise.resolve();
+      return fsMkdirAsync(path, options);
     }
   },
   rmdir(path, callback) {
@@ -3474,55 +3549,39 @@ var fs = {
   },
   stat(path, callback) {
     validateCallback(callback, "cb");
-    normalizePathLike(path);
-    const cb = callback;
-    try {
-      const stats = fs.statSync(path);
-      queueMicrotask(() => cb(null, stats));
-    } catch (e) {
-      queueMicrotask(() => cb(e));
-    }
+    fsStatAsync(path).then(
+      (stats) => callback(null, stats),
+      (error) => callback(error)
+    );
   },
   lstat(path, callback) {
     if (callback) {
-      const cb = callback;
-      try {
-        const stats = fs.lstatSync(path);
-        queueMicrotask(() => cb(null, stats));
-      } catch (e) {
-        queueMicrotask(() => cb(e));
-      }
+      fsLstatAsync(path).then(
+        (stats) => callback(null, stats),
+        (error) => callback(error)
+      );
     } else {
-      return Promise.resolve(fs.lstatSync(path));
+      return fsLstatAsync(path);
     }
   },
   unlink(path, callback) {
     if (callback) {
-      normalizePathLike(path);
-      const cb = callback;
-      try {
-        fs.unlinkSync(path);
-        queueMicrotask(() => cb(null));
-      } catch (e) {
-        queueMicrotask(() => cb(e));
-      }
+      fsUnlinkAsync(path).then(
+        () => callback(null),
+        (error) => callback(error)
+      );
     } else {
-      return Promise.resolve(fs.unlinkSync(path));
+      return fsUnlinkAsync(path);
     }
   },
   rename(oldPath, newPath, callback) {
     if (callback) {
-      normalizePathLike(oldPath, "oldPath");
-      normalizePathLike(newPath, "newPath");
-      const cb = callback;
-      try {
-        fs.renameSync(oldPath, newPath);
-        queueMicrotask(() => cb(null));
-      } catch (e) {
-        queueMicrotask(() => cb(e));
-      }
+      fsRenameAsync(oldPath, newPath).then(
+        () => callback(null),
+        (error) => callback(error)
+      );
     } else {
-      return Promise.resolve(fs.renameSync(oldPath, newPath));
+      return fsRenameAsync(oldPath, newPath);
     }
   },
   copyFile(src, dest, callback) {
@@ -3595,26 +3654,17 @@ var fs = {
       resolvedMode = void 0;
     }
     validateCallback(callback, "cb");
-    normalizePathLike(path);
-    normalizeOpenModeArgument(resolvedMode);
-    const cb = callback;
-    try {
-      const fd = fs.openSync(path, resolvedFlags, resolvedMode);
-      queueMicrotask(() => cb(null, fd));
-    } catch (e) {
-      queueMicrotask(() => cb(e));
-    }
+    fsOpenAsync(path, resolvedFlags, resolvedMode).then(
+      (fd) => callback(null, fd),
+      (error) => callback(error)
+    );
   },
   close(fd, callback) {
-    normalizeFdInteger(fd);
     validateCallback(callback, "cb");
-    const cb = callback;
-    try {
-      fs.closeSync(fd);
-      queueMicrotask(() => cb(null));
-    } catch (e) {
-      queueMicrotask(() => cb(e));
-    }
+    fsCloseAsync(fd).then(
+      () => callback(null),
+      (error) => callback(error)
+    );
   },
   read(fd, buffer, offset, length, position, callback) {
     // Node also supports read(fd, options, callback) and read(fd, callback).
@@ -3709,19 +3759,10 @@ var fs = {
         length,
         position
       );
-      const cb = callback;
-      try {
-        const bytesWritten = fs.writeSync(
-          fd,
-          buffer,
-          offset,
-          length,
-          position
-        );
-        queueMicrotask(() => cb(null, bytesWritten));
-      } catch (e) {
-        queueMicrotask(() => cb(e));
-      }
+      fsWriteAsync(fd, buffer, offset, length, position).then(
+        (bytesWritten) => callback(null, bytesWritten, normalized.buffer),
+        (error) => callback(error)
+      );
     } else {
       return Promise.resolve(
         fs.writeSync(
@@ -3911,7 +3952,7 @@ var fs = {
       return fs.opendirSync(path, options);
     },
     async open(path, flags, mode) {
-      return new FileHandle(fs.openSync(path, flags ?? "r", mode));
+      return new FileHandle(await fsOpenAsync(path, flags ?? "r", mode));
     },
     async statfs(path, options) {
       return fs.statfsSync(path, options);

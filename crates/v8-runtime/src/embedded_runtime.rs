@@ -30,6 +30,10 @@ const TEST_SESSION_OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 
 pub struct EmbeddedV8Runtime {
     session_mgr: Arc<Mutex<SessionManager>>,
+    /// Immutable, thread-safe bridge-call router. Responses arrive on the
+    /// sidecar thread while guest execution owns the session executor; routing
+    /// them must not contend on the session-manager mutex.
+    call_id_router: CallIdRouter,
     session_outputs: Arc<Mutex<HashMap<String, SessionOutput>>>,
     snapshot_cache: Arc<SnapshotCache>,
     alive: Arc<AtomicBool>,
@@ -68,7 +72,7 @@ impl EmbeddedV8Runtime {
         let session_mgr = Arc::new(Mutex::new(SessionManager::new(
             max_concurrency.unwrap_or(configured_max_concurrency),
             crate::session::RuntimeEventSender::closed(),
-            call_id_router,
+            Arc::clone(&call_id_router),
             Arc::clone(&snapshot_cache),
             runtime.clone(),
         )));
@@ -77,6 +81,7 @@ impl EmbeddedV8Runtime {
 
         Ok(Self {
             session_mgr,
+            call_id_router,
             session_outputs,
             snapshot_cache,
             alive,
@@ -276,15 +281,9 @@ impl EmbeddedV8Runtime {
         output_generation: Option<u64>,
         response: BridgeResponse,
     ) -> io::Result<()> {
-        let registry = {
-            let mgr = self
-                .session_mgr
-                .lock()
-                .expect("session manager lock poisoned");
-            Arc::clone(mgr.call_id_router())
-        };
         let phase_start = Instant::now();
-        let result = registry
+        let result = self
+            .call_id_router
             .settle(session_id, output_generation, response)
             .map_err(other_io_error);
         record_sync_bridge_host_phase(

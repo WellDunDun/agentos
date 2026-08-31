@@ -2444,7 +2444,7 @@ async fn run_protocol_engine(engine: ProtocolEngine) -> Result<(), Box<dyn Error
                     );
                     continue 'protocol;
                 };
-                for session in active_sessions.iter().cloned().collect::<Vec<_>>() {
+                for session in &active_sessions {
                     let frame = protocol_try!('protocol,
                         sidecar
                             .poll_event_nowait(&session.compat_ownership_scope())
@@ -2472,7 +2472,7 @@ async fn run_protocol_engine(engine: ProtocolEngine) -> Result<(), Box<dyn Error
             }
             _ = process_event_notify.notified(), if pending_owned_process_events.len() < owned_process_event_capacity => {
                 let mut routed_process_event_progress = false;
-                for session in active_sessions.iter().cloned().collect::<Vec<_>>() {
+                for session in &active_sessions {
                     let remaining_claims = owned_process_event_capacity
                         .saturating_sub(pending_owned_process_events.len());
                     if remaining_claims == 0 {
@@ -2500,6 +2500,16 @@ async fn run_protocol_engine(engine: ProtocolEngine) -> Result<(), Box<dyn Error
                         )
                         .admit_vm_event_nowait()
                         {
+                            Ok(VmEventAdmissionResult::Admitted(prepared))
+                                if extension_service_tasks.len()
+                                    < extension_service_capacity =>
+                            {
+                                schedule_extension_service_command(
+                                    prepared,
+                                    &extension_service_completion_tx,
+                                    &mut extension_service_tasks,
+                                );
+                            }
                             Ok(VmEventAdmissionResult::Admitted(prepared)
                             | VmEventAdmissionResult::Deferred(prepared)) => {
                                 pending_owned_process_events.push_back(prepared);
@@ -2518,6 +2528,16 @@ async fn run_protocol_engine(engine: ProtocolEngine) -> Result<(), Box<dyn Error
                         )
                         .admit_vm_event_nowait()
                         {
+                            Ok(VmEventAdmissionResult::Admitted(prepared))
+                                if extension_service_tasks.len()
+                                    < extension_service_capacity =>
+                            {
+                                schedule_extension_service_command(
+                                    prepared,
+                                    &extension_service_completion_tx,
+                                    &mut extension_service_tasks,
+                                );
+                            }
                             Ok(VmEventAdmissionResult::Admitted(prepared)
                             | VmEventAdmissionResult::Deferred(prepared)) => {
                                 pending_owned_process_events.push_back(prepared);
@@ -2536,6 +2556,16 @@ async fn run_protocol_engine(engine: ProtocolEngine) -> Result<(), Box<dyn Error
                         )
                         .admit_vm_event_nowait()
                         {
+                            Ok(VmEventAdmissionResult::Admitted(prepared))
+                                if extension_service_tasks.len()
+                                    < extension_service_capacity =>
+                            {
+                                schedule_extension_service_command(
+                                    prepared,
+                                    &extension_service_completion_tx,
+                                    &mut extension_service_tasks,
+                                );
+                            }
                             Ok(VmEventAdmissionResult::Admitted(prepared)
                             | VmEventAdmissionResult::Deferred(prepared)) => {
                                 pending_owned_process_events.push_back(prepared);
@@ -2554,6 +2584,16 @@ async fn run_protocol_engine(engine: ProtocolEngine) -> Result<(), Box<dyn Error
                         )
                         .admit_vm_event_nowait()
                         {
+                            Ok(VmEventAdmissionResult::Admitted(prepared))
+                                if extension_service_tasks.len()
+                                    < extension_service_capacity =>
+                            {
+                                schedule_extension_service_command(
+                                    prepared,
+                                    &extension_service_completion_tx,
+                                    &mut extension_service_tasks,
+                                );
+                            }
                             Ok(VmEventAdmissionResult::Admitted(prepared)
                             | VmEventAdmissionResult::Deferred(prepared)) => {
                                 pending_owned_process_events.push_back(prepared);
@@ -5106,6 +5146,14 @@ mod tests {
         capacity: usize,
         max_in_flight: usize,
     ) -> (ProtocolFrameWriter, Arc<ProtocolOutputQueue>) {
+        test_frame_writer_with_inflight_and_progress(capacity, max_in_flight, 1)
+    }
+
+    fn test_frame_writer_with_inflight_and_progress(
+        capacity: usize,
+        max_in_flight: usize,
+        max_progress: usize,
+    ) -> (ProtocolFrameWriter, Arc<ProtocolOutputQueue>) {
         let codec = WireFrameCodec::new(4096);
         let ordinary_capacity = capacity.max(2);
         let control_capacity = capacity.max(max_in_flight.saturating_add(3));
@@ -5123,8 +5171,8 @@ mod tests {
         protocol.max_terminal_frames = max_in_flight;
         protocol.max_terminal_bytes = max_in_flight.saturating_mul(maximum_encoded_bytes);
         protocol.terminal_fallback_bytes = maximum_encoded_bytes;
-        protocol.max_progress_frames = 1;
-        protocol.max_progress_bytes = maximum_encoded_bytes;
+        protocol.max_progress_frames = max_progress;
+        protocol.max_progress_bytes = max_progress.saturating_mul(maximum_encoded_bytes);
         protocol.max_rejection_frames = 1;
         protocol.max_rejection_bytes = maximum_encoded_bytes;
         (
@@ -9194,7 +9242,7 @@ export async function loadPyodide() {
 
     #[tokio::test]
     async fn protocol_output_progress_burst_cannot_starve_terminal_response() {
-        let (writer, output) = test_frame_writer(16);
+        let (writer, output) = test_frame_writer_with_inflight_and_progress(16, 1, 2);
         writer
             .try_send_progress(queue_test_sidecar_request(-1))
             .expect("queue first progress frame");

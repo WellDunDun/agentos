@@ -4063,7 +4063,11 @@ where
                     build_host_node_cli_eval(&cli),
                 );
                 prepare_guest_runtime_env(vm, &mut env, &guest_cwd, &host_cwd, None)?;
-                add_runtime_guest_path_mapping(&mut env, &cli.guest_root, &cli.package_root);
+                add_read_only_runtime_guest_path_mapping(
+                    &mut env,
+                    &cli.guest_root,
+                    &cli.package_root,
+                );
                 add_runtime_host_access_path(
                     &mut env,
                     "AGENTOS_EXTRA_FS_READ_PATHS",

@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,7 @@ struct SyncBridgeHostPhaseStats {
 static SYNC_BRIDGE_HOST_PHASES: std::sync::OnceLock<
     std::sync::Mutex<BTreeMap<String, SyncBridgeHostPhaseStats>>,
 > = std::sync::OnceLock::new();
+static SYNC_BRIDGE_HOST_PHASE_RECORDS: AtomicU64 = AtomicU64::new(0);
 static SYNC_BRIDGE_CALL_METHODS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, String>>> =
     std::sync::OnceLock::new();
 
@@ -81,7 +82,10 @@ pub(crate) fn record_sync_bridge_host_phase(method: &str, stage: &str, elapsed: 
     entry.total_us = entry.total_us.wrapping_add(elapsed_us);
     entry.max_us = entry.max_us.max(elapsed_us);
 
-    if let Ok(path) = std::env::var("AGENTOS_SYNC_BRIDGE_HOST_PHASES_FILE") {
+    if SYNC_BRIDGE_HOST_PHASE_RECORDS.fetch_add(1, Ordering::Relaxed) % 512 == 511 {
+        let Ok(path) = std::env::var("AGENTOS_SYNC_BRIDGE_HOST_PHASES_FILE") else {
+            return;
+        };
         let mut lines = String::new();
         for (key, value) in stats.iter() {
             let Some((method, stage)) = key.split_once(':') else {
@@ -236,6 +240,7 @@ impl BridgeResponseReceiver for ReaderBridgeResponseReceiver {
 
 const MAX_PENDING_BRIDGE_CALLS: usize = 16_384;
 pub(crate) const DEFAULT_BRIDGE_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+static NEXT_ASYNC_RESPONSE_LANE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BridgeCallTargetKind {
@@ -247,6 +252,7 @@ struct BridgeCallTarget {
     session_id: String,
     session_generation: Option<u64>,
     kind: BridgeCallTargetKind,
+    async_response_lane_id: Option<u64>,
     sender: crossbeam_channel::Sender<BridgeResponse>,
     _call_reservation: Reservation,
     _request_reservation: Reservation,
@@ -255,8 +261,18 @@ struct BridgeCallTarget {
     max_response_bytes: usize,
     deadline: Instant,
     timeout: Duration,
-    _deadline_cancellation: tokio::sync::oneshot::Sender<()>,
+    _deadline_wake: BridgeDeadlineWake,
     host_visible: bool,
+}
+
+struct BridgeDeadlineWake(Option<Arc<BridgeDeadlineSupervisor>>);
+
+impl Drop for BridgeDeadlineWake {
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.0.as_ref() {
+            supervisor.wake.notify_one();
+        }
+    }
 }
 
 const BRIDGE_TERMINAL_RESPONSE_RESERVATION_BYTES: usize = 4 * 1024;
@@ -396,8 +412,17 @@ impl RetiredBridgeCalls {
 ///
 /// A response is settled directly into the target registered for its globally
 /// unique call ID. It never enters the ordinary session command/event channel.
+#[derive(Default)]
+struct PendingBridgeCalls {
+    targets: HashMap<u64, BridgeCallTarget>,
+    /// Number of registered (not yet queued) responses per in-process async
+    /// response lane. Keeping this beside the targets makes route removal and
+    /// lane-capacity release one atomic registry update.
+    async_response_lane_registrations: HashMap<u64, usize>,
+}
+
 pub struct BridgeCallRegistry {
-    pending: Mutex<HashMap<u64, BridgeCallTarget>>,
+    pending: Mutex<PendingBridgeCalls>,
     /// Bounded proof that a host-visible call was canceled before settlement.
     /// This distinguishes expected teardown completions from arbitrary unknown
     /// or duplicate responses without keeping retired calls forever.
@@ -408,7 +433,7 @@ pub struct BridgeCallRegistry {
 impl BridgeCallRegistry {
     pub fn new(max_pending: usize) -> Self {
         Self {
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingBridgeCalls::default()),
             retired: Mutex::new(RetiredBridgeCalls::default()),
             max_pending: max_pending.max(1),
         }
@@ -428,9 +453,11 @@ impl BridgeCallRegistry {
         session_id: &str,
         session_generation: Option<u64>,
         kind: BridgeCallTargetKind,
+        async_response_lane_id: Option<u64>,
         sender: crossbeam_channel::Sender<BridgeResponse>,
         timeout: Duration,
-    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+        deadline_supervisor: Option<Arc<BridgeDeadlineSupervisor>>,
+    ) -> Result<(), String> {
         if timeout.is_zero() {
             return Err(String::from(
                 "ERR_AGENTOS_BRIDGE_CALL_TIMEOUT_INVALID: limits.reactor.operationDeadlineMs must be greater than zero",
@@ -473,7 +500,7 @@ impl BridgeCallRegistry {
         let mut pending = self.pending.lock().map_err(|_| {
             String::from("ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: bridge registry lock poisoned")
         })?;
-        if pending.len() >= self.max_pending {
+        if pending.targets.len() >= self.max_pending {
             return Err(format!(
                 "ERR_AGENTOS_BRIDGE_CALL_LIMIT: bridge call registry exceeded limit of {} pending calls; raise runtime.resources.maxBridgeCalls",
                 self.max_pending
@@ -486,13 +513,25 @@ impl BridgeCallRegistry {
                 )
             })?;
             let queued_responses = sender.len();
-            let registered_targets = pending
-                .values()
-                .filter(|target| {
-                    target.kind == BridgeCallTargetKind::Async
-                        && target.sender.same_channel(&sender)
-                })
-                .count();
+            let registered_targets = async_response_lane_id.map_or_else(
+                || {
+                    pending
+                        .targets
+                        .values()
+                        .filter(|target| {
+                            target.kind == BridgeCallTargetKind::Async
+                                && target.sender.same_channel(&sender)
+                        })
+                        .count()
+                },
+                |lane_id| {
+                    pending
+                        .async_response_lane_registrations
+                        .get(&lane_id)
+                        .copied()
+                        .unwrap_or(0)
+                },
+            );
             let occupied = queued_responses.saturating_add(registered_targets);
             if occupied >= response_capacity {
                 return Err(format!(
@@ -500,7 +539,7 @@ impl BridgeCallRegistry {
                 ));
             }
         }
-        if pending.contains_key(&call_id) {
+        if pending.targets.contains_key(&call_id) {
             return Err(format!(
                 "ERR_AGENTOS_BRIDGE_DUPLICATE_CALL_ID: duplicate bridge call_id {call_id}"
             ));
@@ -513,13 +552,24 @@ impl BridgeCallRegistry {
                 )
             })?
             .remove(call_id);
-        let (deadline_cancellation, deadline_cancelled) = tokio::sync::oneshot::channel();
-        pending.insert(
+        if let Some(lane_id) = async_response_lane_id {
+            let registered = pending
+                .async_response_lane_registrations
+                .entry(lane_id)
+                .or_insert(0);
+            *registered = registered.checked_add(1).ok_or_else(|| {
+                String::from(
+                    "ERR_AGENTOS_BRIDGE_RESPONSE_LANE_LIMIT: async response lane registration count overflowed",
+                )
+            })?;
+        }
+        pending.targets.insert(
             call_id,
             BridgeCallTarget {
                 session_id: session_id.to_owned(),
                 session_generation,
                 kind,
+                async_response_lane_id,
                 sender,
                 _call_reservation: call_reservation,
                 _request_reservation: request_reservation,
@@ -530,11 +580,11 @@ impl BridgeCallRegistry {
                     .checked_add(timeout)
                     .unwrap_or_else(Instant::now),
                 timeout,
-                _deadline_cancellation: deadline_cancellation,
+                _deadline_wake: BridgeDeadlineWake(deadline_supervisor),
                 host_visible: false,
             },
         );
-        Ok(deadline_cancelled)
+        Ok(())
     }
 
     /// Marks the point after which cancellation can race a legitimate host
@@ -543,7 +593,7 @@ impl BridgeCallRegistry {
         let mut pending = self.pending.lock().map_err(|_| {
             String::from("ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: bridge registry lock poisoned")
         })?;
-        let target = pending.get_mut(&call_id).ok_or_else(|| {
+        let target = pending.targets.get_mut(&call_id).ok_or_else(|| {
             format!(
                 "ERR_AGENTOS_BRIDGE_ROUTE_RETIRED: bridge call_id {call_id} was canceled before host publication"
             )
@@ -584,7 +634,7 @@ impl BridgeCallRegistry {
         timeout: Duration,
     ) -> Result<crossbeam_channel::Receiver<BridgeResponse>, String> {
         let (sender, receiver) = crossbeam_channel::bounded(1);
-        let _deadline_cancelled = self.register(
+        self.register(
             runtime,
             request_bytes,
             max_response_bytes,
@@ -592,8 +642,10 @@ impl BridgeCallRegistry {
             session_id,
             session_generation,
             BridgeCallTargetKind::Sync,
+            None,
             sender,
             timeout,
+            None,
         )?;
         Ok(receiver)
     }
@@ -617,10 +669,11 @@ impl BridgeCallRegistry {
             session_id,
             session_generation,
             BridgeCallTargetKind::Async,
+            None,
             sender,
             DEFAULT_BRIDGE_CALL_TIMEOUT,
+            None,
         )
-        .map(drop)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -633,8 +686,10 @@ impl BridgeCallRegistry {
         session_id: &str,
         session_generation: Option<u64>,
         sender: crossbeam_channel::Sender<BridgeResponse>,
+        async_response_lane_id: u64,
         timeout: Duration,
-    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+        deadline_supervisor: Arc<BridgeDeadlineSupervisor>,
+    ) -> Result<(), String> {
         self.register(
             runtime,
             request_bytes,
@@ -643,8 +698,10 @@ impl BridgeCallRegistry {
             session_id,
             session_generation,
             BridgeCallTargetKind::Async,
+            Some(async_response_lane_id),
             sender,
             timeout,
+            Some(deadline_supervisor),
         )
     }
 
@@ -653,14 +710,17 @@ impl BridgeCallRegistry {
             String::from("ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: bridge registry lock poisoned")
         })?;
         if pending
+            .targets
             .get(&call_id)
             .is_none_or(|target| Instant::now() < target.deadline)
         {
             return Ok(false);
         }
         let target = pending
+            .targets
             .remove(&call_id)
             .expect("expired bridge target must remain registered while locked");
+        Self::release_async_response_lane_registration(&mut pending, &target)?;
         if target.host_visible {
             self.retired
                 .lock()
@@ -675,6 +735,54 @@ impl BridgeCallRegistry {
         Ok(true)
     }
 
+    fn next_async_deadline(
+        &self,
+        session_id: &str,
+        session_generation: Option<u64>,
+    ) -> Result<Option<Instant>, String> {
+        let pending = self.pending.lock().map_err(|_| {
+            String::from("ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: bridge registry lock poisoned")
+        })?;
+        Ok(pending
+            .targets
+            .values()
+            .filter(|target| {
+                target.kind == BridgeCallTargetKind::Async
+                    && target.session_id == session_id
+                    && target.session_generation == session_generation
+            })
+            .map(|target| target.deadline)
+            .min())
+    }
+
+    fn expire_async_deadlines(
+        &self,
+        session_id: &str,
+        session_generation: Option<u64>,
+    ) -> Result<(), String> {
+        let now = Instant::now();
+        let expired = self
+            .pending
+            .lock()
+            .map_err(|_| {
+                String::from("ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: bridge registry lock poisoned")
+            })?
+            .targets
+            .iter()
+            .filter_map(|(call_id, target)| {
+                (target.kind == BridgeCallTargetKind::Async
+                    && target.session_id == session_id
+                    && target.session_generation == session_generation
+                    && now >= target.deadline)
+                    .then_some(*call_id)
+            })
+            .collect::<Vec<_>>();
+        for call_id in expired {
+            self.timeout(call_id)?;
+        }
+        Ok(())
+    }
+
     pub fn settle(
         &self,
         supplied_session_id: &str,
@@ -685,7 +793,7 @@ impl BridgeCallRegistry {
         let mut pending = self.pending.lock().map_err(|_| {
             String::from("ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: bridge registry lock poisoned")
         })?;
-        let target = match pending.get(&response.call_id) {
+        let target = match pending.targets.get(&response.call_id) {
             Some(target) => target,
             None => {
                 let retired = self.retired.lock().map_err(|_| {
@@ -738,8 +846,10 @@ impl BridgeCallRegistry {
         // re-admitted in the gap between the take and try_send.
         let deadline_expired = Instant::now() >= target.deadline;
         let mut target = pending
+            .targets
             .remove(&call_id)
             .expect("validated bridge target must remain registered while locked");
+        Self::release_async_response_lane_registration(&mut pending, &target)?;
 
         if deadline_expired {
             if target.host_visible {
@@ -869,7 +979,14 @@ impl BridgeCallRegistry {
     fn cancel_with_visibility(&self, call_id: u64, force_unpublished: bool) {
         match self.pending.lock() {
             Ok(mut pending) => {
-                let target = pending.remove(&call_id);
+                let target = pending.targets.remove(&call_id);
+                if let Some(target) = target.as_ref() {
+                    if let Err(error) =
+                        Self::release_async_response_lane_registration(&mut pending, target)
+                    {
+                        eprintln!("{error}");
+                    }
+                }
                 match self.retired.lock() {
                     Ok(mut retired) => {
                         if force_unpublished {
@@ -907,6 +1024,7 @@ impl BridgeCallRegistry {
         match self.pending.lock() {
             Ok(mut pending) => {
                 let canceled_call_ids = pending
+                    .targets
                     .iter()
                     .filter_map(|(call_id, target)| {
                         (target.session_id == session_id
@@ -915,24 +1033,25 @@ impl BridgeCallRegistry {
                         .then_some(*call_id)
                     })
                     .collect::<Vec<_>>();
-                let mut retired = match self.retired.lock() {
-                    Ok(retired) => retired,
-                    Err(_) => {
-                        eprintln!(
-                            "ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: could not retire bridge calls for session {session_id} generation {session_generation:?}"
-                        );
-                        pending.retain(|_, target| {
-                            target.session_id != session_id
-                                || (session_generation.is_some()
-                                    && target.session_generation != session_generation)
-                        });
-                        return;
-                    }
-                };
+                let mut retired = self.retired.lock().ok();
+                if retired.is_none() {
+                    eprintln!(
+                        "ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: could not retire bridge calls for session {session_id} generation {session_generation:?}"
+                    );
+                }
                 for call_id in canceled_call_ids {
-                    if let Some(target) = pending.remove(&call_id) {
+                    if let Some(target) = pending.targets.remove(&call_id) {
+                        if let Err(error) = Self::release_async_response_lane_registration(
+                            &mut pending,
+                            &target,
+                        )
+                        {
+                            eprintln!("{error}");
+                        }
                         if target.host_visible {
-                            retired.insert(call_id, &target, self.max_pending);
+                            if let Some(retired) = retired.as_mut() {
+                                retired.insert(call_id, &target, self.max_pending);
+                            }
                         }
                     }
                 }
@@ -947,17 +1066,46 @@ impl BridgeCallRegistry {
         match self.pending.lock() {
             Ok(mut pending) => match self.retired.lock() {
                 Ok(mut retired) => {
-                    for (call_id, target) in pending.drain() {
+                    let targets = pending.targets.drain().collect::<Vec<_>>();
+                    for (call_id, target) in targets {
+                        if let Err(error) =
+                            Self::release_async_response_lane_registration(&mut pending, &target)
+                        {
+                            eprintln!("{error}");
+                        }
                         if target.host_visible {
                             retired.insert(call_id, &target, self.max_pending);
                         }
+                    }
+                    if !pending.async_response_lane_registrations.is_empty() {
+                        eprintln!(
+                            "ERR_AGENTOS_BRIDGE_RESPONSE_ACCOUNTING: async response lane registrations remained after clearing all bridge calls"
+                        );
+                        pending.async_response_lane_registrations.clear();
                     }
                 }
                 Err(_) => {
                     eprintln!(
                         "ERR_AGENTOS_BRIDGE_REGISTRY_POISONED: could not retire cleared bridge calls"
                     );
-                    pending.clear();
+                    let targets = pending
+                        .targets
+                        .drain()
+                        .map(|(_, target)| target)
+                        .collect::<Vec<_>>();
+                    for target in targets {
+                        if let Err(error) =
+                            Self::release_async_response_lane_registration(&mut pending, &target)
+                        {
+                            eprintln!("{error}");
+                        }
+                    }
+                    if !pending.async_response_lane_registrations.is_empty() {
+                        eprintln!(
+                            "ERR_AGENTOS_BRIDGE_RESPONSE_ACCOUNTING: async response lane registrations remained after clearing all bridge calls"
+                        );
+                        pending.async_response_lane_registrations.clear();
+                    }
                 }
             },
             Err(_) => eprintln!(
@@ -969,8 +1117,8 @@ impl BridgeCallRegistry {
     #[cfg(test)]
     pub fn pending_len(&self) -> usize {
         self.pending
-            .lock()
-            .map(|pending| pending.len())
+            .try_lock()
+            .map(|pending| pending.targets.len())
             .unwrap_or(0)
     }
 
@@ -980,6 +1128,32 @@ impl BridgeCallRegistry {
             .lock()
             .map(|retired| retired.by_call_id.len())
             .unwrap_or(0)
+    }
+
+    fn release_async_response_lane_registration(
+        pending: &mut PendingBridgeCalls,
+        target: &BridgeCallTarget,
+    ) -> Result<(), String> {
+        let Some(lane_id) = target.async_response_lane_id else {
+            return Ok(());
+        };
+        let registered = pending
+            .async_response_lane_registrations
+            .get_mut(&lane_id)
+            .ok_or_else(|| {
+            format!(
+                "ERR_AGENTOS_BRIDGE_RESPONSE_ACCOUNTING: async response lane {lane_id} has no registered calls"
+            )
+        })?;
+        *registered = registered.checked_sub(1).ok_or_else(|| {
+            format!(
+                "ERR_AGENTOS_BRIDGE_RESPONSE_ACCOUNTING: async response lane {lane_id} registration count underflowed"
+            )
+        })?;
+        if *registered == 0 {
+            pending.async_response_lane_registrations.remove(&lane_id);
+        }
+        Ok(())
     }
 }
 
@@ -998,6 +1172,22 @@ pub type SharedCallIdCounter = Arc<AtomicU64>;
 struct PendingBridgeRoute {
     registry: CallIdRouter,
     call_id: Option<u64>,
+}
+
+struct BridgeDeadlineSupervisor {
+    started: AtomicBool,
+    closed: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl BridgeDeadlineSupervisor {
+    fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
 }
 
 impl PendingBridgeRoute {
@@ -1060,6 +1250,7 @@ pub struct BridgeCallContext {
     call_id_router: Option<CallIdRouter>,
     session_generation: Option<u64>,
     async_response_tx: Option<crossbeam_channel::Sender<BridgeResponse>>,
+    async_response_lane_id: Option<u64>,
     abort_rx: Option<crossbeam_channel::Receiver<()>>,
     /// Execution gate shared with the owning session. Direct response routing
     /// bypasses the ordinary command lane, but a sync response must still stop
@@ -1070,6 +1261,7 @@ pub struct BridgeCallContext {
     /// never arm runtime work.
     runtime: Option<agentos_runtime::RuntimeContext>,
     bridge_call_timeout: Duration,
+    deadline_supervisor: Arc<BridgeDeadlineSupervisor>,
 }
 
 pub struct PreparedAsyncBridgeCall {
@@ -1120,10 +1312,12 @@ impl BridgeCallContext {
             call_id_router: None,
             session_generation: None,
             async_response_tx: None,
+            async_response_lane_id: None,
             abort_rx: None,
             pause_control: None,
             runtime: None,
             bridge_call_timeout: DEFAULT_BRIDGE_CALL_TIMEOUT,
+            deadline_supervisor: Arc::new(BridgeDeadlineSupervisor::new()),
         }
     }
 
@@ -1148,10 +1342,12 @@ impl BridgeCallContext {
             call_id_router: None,
             session_generation: None,
             async_response_tx: None,
+            async_response_lane_id: None,
             abort_rx: None,
             pause_control: None,
             runtime: None,
             bridge_call_timeout: DEFAULT_BRIDGE_CALL_TIMEOUT,
+            deadline_supervisor: Arc::new(BridgeDeadlineSupervisor::new()),
         }
     }
 
@@ -1175,10 +1371,12 @@ impl BridgeCallContext {
             call_id_router: None,
             session_generation: None,
             async_response_tx: None,
+            async_response_lane_id: None,
             abort_rx: None,
             pause_control: None,
             runtime: None,
             bridge_call_timeout: DEFAULT_BRIDGE_CALL_TIMEOUT,
+            deadline_supervisor: Arc::new(BridgeDeadlineSupervisor::new()),
         }
     }
 
@@ -1205,10 +1403,14 @@ impl BridgeCallContext {
             call_id_router: Some(registry),
             session_generation,
             async_response_tx: Some(async_response_tx),
+            async_response_lane_id: Some(
+                NEXT_ASYNC_RESPONSE_LANE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
             abort_rx: Some(abort_rx),
             pause_control: Some(pause_control),
             runtime: Some(runtime),
             bridge_call_timeout,
+            deadline_supervisor: Arc::new(BridgeDeadlineSupervisor::new()),
         }
     }
 
@@ -1219,6 +1421,117 @@ impl BridgeCallContext {
     pub(crate) fn timer_task_owner(&self) -> Option<agentos_runtime::TaskOwner> {
         self.session_generation
             .map(|generation| agentos_runtime::TaskOwner::Vm { generation })
+    }
+
+    fn ensure_async_deadline_supervisor(
+        &self,
+        registry: &CallIdRouter,
+        runtime: &RuntimeContext,
+    ) -> Result<(), String> {
+        if self.deadline_supervisor.started.load(Ordering::Acquire) {
+            self.deadline_supervisor.wake.notify_one();
+            return Ok(());
+        }
+        if self
+            .deadline_supervisor
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.deadline_supervisor.wake.notify_one();
+            return Ok(());
+        }
+
+        let weak_registry = Arc::downgrade(registry);
+        let supervisor = Arc::clone(&self.deadline_supervisor);
+        let session_id = self.session_id.clone();
+        let session_generation = self.session_generation;
+        if let Err(error) = runtime.spawn(agentos_runtime::TaskClass::Timer, async move {
+            loop {
+                if supervisor.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                let Some(registry) = weak_registry.upgrade() else {
+                    break;
+                };
+                let deadline = match registry
+                    .next_async_deadline(&session_id, session_generation)
+                {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        break;
+                    }
+                };
+                drop(registry);
+
+                match deadline {
+                    Some(deadline) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                                if let Some(registry) = weak_registry.upgrade() {
+                                    if let Err(error) = registry.expire_async_deadlines(
+                                        &session_id,
+                                        session_generation,
+                                    ) {
+                                        eprintln!("{error}");
+                                    }
+                                }
+                            }
+                            _ = supervisor.wake.notified() => {}
+                        }
+                    }
+                    None => {
+                        // Promise continuations commonly submit the next bridge
+                        // call immediately after the prior response. Keep the
+                        // one bounded supervisor alive for a short idle turn so
+                        // sequential async I/O does not allocate one timer task
+                        // per operation.
+                        tokio::select! {
+                            _ = supervisor.wake.notified() => continue,
+                            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                        }
+                        supervisor.started.store(false, Ordering::Release);
+                        if supervisor.closed.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let has_pending_deadline = weak_registry
+                            .upgrade()
+                            .and_then(|registry| {
+                                registry
+                                    .next_async_deadline(&session_id, session_generation)
+                                    .map_err(|error| eprintln!("{error}"))
+                                    .ok()
+                                    .flatten()
+                            })
+                            .is_some();
+                        if has_pending_deadline
+                            && supervisor
+                                .started
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+        }) {
+            self.deadline_supervisor
+                .started
+                .store(false, Ordering::Release);
+            return Err(format!(
+                "ERR_AGENTOS_BRIDGE_DEADLINE_TASK: failed to arm bridge deadline supervisor: {error}"
+            ));
+        }
+        self.deadline_supervisor.wake.notify_one();
+        Ok(())
     }
 
     /// Perform a sync-blocking bridge call.
@@ -1444,7 +1757,7 @@ impl BridgeCallContext {
                     "ERR_AGENTOS_BRIDGE_RESPONSE_DELIVERY: async response lane is unavailable",
                 )
             })?;
-            let mut deadline_cancelled = registry.register_async_with_timeout(
+            registry.register_async_with_timeout(
                 runtime,
                 args.len(),
                 max_response_bytes,
@@ -1452,27 +1765,17 @@ impl BridgeCallContext {
                 &self.session_id,
                 self.session_generation,
                 sender.clone(),
+                self.async_response_lane_id
+                    .expect("registry-backed async response lane must have an ID"),
                 self.bridge_call_timeout,
+                Arc::clone(&self.deadline_supervisor),
             )?;
-            let deadline_registry = Arc::clone(registry);
-            let timeout = self.bridge_call_timeout;
-            if let Err(error) = runtime.spawn(agentos_runtime::TaskClass::Timer, async move {
-                if tokio::time::timeout(timeout, &mut deadline_cancelled)
-                    .await
-                    .is_err()
-                {
-                    if let Err(error) = deadline_registry.timeout(call_id) {
-                        eprintln!("{error}");
-                    }
-                }
-            }) {
+            if let Err(error) = self.ensure_async_deadline_supervisor(registry, runtime) {
                 // Registration already owns call/request/response capacity.
                 // If supervision rejects the timer, retract the unpublished
                 // route before returning so admission cannot leak permanently.
                 registry.cancel_unpublished(call_id);
-                return Err(format!(
-                    "ERR_AGENTOS_BRIDGE_DEADLINE_TASK: failed to arm bridge call_id {call_id} deadline: {error}"
-                ));
+                return Err(error);
             }
             Some(PendingBridgeRoute::new(Arc::clone(registry), call_id))
         } else {
@@ -1565,6 +1868,10 @@ impl BridgeCallContext {
 
 impl Drop for BridgeCallContext {
     fn drop(&mut self) {
+        self.deadline_supervisor
+            .closed
+            .store(true, Ordering::Release);
+        self.deadline_supervisor.wake.notify_one();
         if let Some(registry) = self.call_id_router.as_ref() {
             registry.cancel_session(&self.session_id, self.session_generation);
         }

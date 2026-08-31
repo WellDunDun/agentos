@@ -2282,7 +2282,7 @@ fn python_javascript_sync_rpc_action(
         }));
     }
 
-    if request.method == "fs.closeSync" {
+    if matches!(request.method.as_str(), "fs.close" | "fs.closeSync") {
         let Some(fd) = request.args.first().and_then(Value::as_u64) else {
             return Ok(None);
         };
@@ -2316,7 +2316,7 @@ fn python_javascript_sync_rpc_action(
     };
 
     Ok(Some(match request.method.as_str() {
-        "fs.openSync" => {
+        "fs.open" | "fs.openSync" => {
             let flags = request.args.get(1).unwrap_or(&Value::Null);
             let read_only = matches!(flags.as_str(), Some("r"))
                 || flags.as_u64().is_some_and(|flags| flags == 0);
@@ -2990,6 +2990,49 @@ mod tests {
         assert!(matches!(
             python_javascript_sync_rpc_action(&pyodide, &mut files, &close)
                 .expect("route managed close"),
+            Some(PythonJavascriptSyncRpcAction::Success(
+                serde_json::Value::Null
+            ))
+        ));
+        assert!(files.files.is_empty());
+    }
+
+    #[test]
+    fn python_managed_asset_descriptor_accepts_async_open_and_close_bridge_methods() {
+        let temp = tempdir().expect("create temp dir");
+        let pyodide = temp.path().join("pyodide");
+        fs::create_dir_all(&pyodide).expect("create pyodide root");
+        fs::write(pyodide.join("python_stdlib.zip"), b"stdlib-bytes").expect("write managed asset");
+        let mut files = PythonManagedHostFiles::default();
+        let open = JavascriptSyncRpcRequest {
+            id: 1,
+            method: String::from("fs.open"),
+            args: vec![
+                serde_json::Value::String(format!("{PYODIDE_GUEST_ROOT}/python_stdlib.zip")),
+                serde_json::json!(0),
+                serde_json::Value::Null,
+            ],
+            raw_bytes_args: HashMap::new(),
+        };
+        let fd = match python_javascript_sync_rpc_action(&pyodide, &mut files, &open)
+            .expect("route managed async open")
+            .expect("managed open action")
+        {
+            PythonJavascriptSyncRpcAction::Success(value) => {
+                value.as_u64().expect("managed descriptor")
+            }
+            other => panic!("unexpected managed open action: {other:?}"),
+        };
+
+        let close = JavascriptSyncRpcRequest {
+            id: 2,
+            method: String::from("fs.close"),
+            args: vec![serde_json::json!(fd)],
+            raw_bytes_args: HashMap::new(),
+        };
+        assert!(matches!(
+            python_javascript_sync_rpc_action(&pyodide, &mut files, &close)
+                .expect("route managed async close"),
             Some(PythonJavascriptSyncRpcAction::Success(
                 serde_json::Value::Null
             ))

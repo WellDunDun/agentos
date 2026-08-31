@@ -57,6 +57,15 @@ pub trait MountedFileSystem: Any {
         let _ = mode;
         self.create_file_exclusive(path, content)
     }
+    fn create_file_exclusive_with_mode_stat(
+        &mut self,
+        path: &str,
+        content: Vec<u8>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        self.create_file_exclusive_with_mode(path, content, mode)?;
+        self.stat(path)
+    }
     fn append_file(&mut self, path: &str, content: Vec<u8>) -> VfsResult<u64> {
         let mut existing = self.read_file(path)?;
         existing.extend_from_slice(&content);
@@ -90,6 +99,13 @@ pub trait MountedFileSystem: Any {
     fn symlink(&mut self, target: &str, link_path: &str) -> VfsResult<()>;
     fn read_link(&self, path: &str) -> VfsResult<String>;
     fn lstat(&self, path: &str) -> VfsResult<VirtualStat>;
+    fn lstat_exact(&self, path: &str) -> Option<VirtualStat> {
+        let _ = path;
+        None
+    }
+    fn stat_exact(&self, path: &str) -> Option<VirtualStat> {
+        self.lstat_exact(path).filter(|stat| !stat.is_symbolic_link)
+    }
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()>;
     fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()>;
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()>;
@@ -379,6 +395,20 @@ where
         VirtualFileSystem::create_file_exclusive_with_mode(&mut self.inner, path, content, mode)
     }
 
+    fn create_file_exclusive_with_mode_stat(
+        &mut self,
+        path: &str,
+        content: Vec<u8>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        VirtualFileSystem::create_file_exclusive_with_mode_stat(
+            &mut self.inner,
+            path,
+            content,
+            mode,
+        )
+    }
+
     fn append_file(&mut self, path: &str, content: Vec<u8>) -> VfsResult<u64> {
         VirtualFileSystem::append_file(&mut self.inner, path, content)
     }
@@ -437,6 +467,14 @@ where
 
     fn lstat(&self, path: &str) -> VfsResult<VirtualStat> {
         VirtualFileSystem::lstat(&self.inner, path)
+    }
+
+    fn lstat_exact(&self, path: &str) -> Option<VirtualStat> {
+        VirtualFileSystem::lstat_exact(&self.inner, path)
+    }
+
+    fn stat_exact(&self, path: &str) -> Option<VirtualStat> {
+        VirtualFileSystem::stat_exact(&self.inner, path)
     }
 
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
@@ -1153,6 +1191,10 @@ struct MountRegistration {
 pub struct MountTable {
     mounts: Vec<MountRegistration>,
     mount_indices: BTreeMap<String, usize>,
+    /// First path component of every non-root mount. A path whose first
+    /// component is absent here is provably owned by `/`, avoiding an ancestor
+    /// walk for deep package-manager paths such as `/workspace/node_modules/...`.
+    non_root_mount_roots: BTreeSet<String>,
 }
 
 impl MountTable {
@@ -1172,6 +1214,7 @@ impl MountTable {
                 filesystem: Box::new(MountedVirtualFileSystem::new(root_fs)),
             }],
             mount_indices: BTreeMap::from([(String::from("/"), 0)]),
+            non_root_mount_roots: BTreeSet::new(),
         }
     }
 
@@ -1197,6 +1240,7 @@ impl MountTable {
                 filesystem,
             }],
             mount_indices: BTreeMap::from([(String::from("/"), 0)]),
+            non_root_mount_roots: BTreeSet::new(),
         }
     }
 
@@ -1485,7 +1529,19 @@ impl MountTable {
         before: Option<VirtualStat>,
         relative_path: &str,
     ) {
+        if self.mounts[index].cached_usage.is_none() {
+            return;
+        }
         let after = self.mounts[index].filesystem.lstat(relative_path).ok();
+        self.update_cached_path_usage_with_after(index, before, after);
+    }
+
+    fn update_cached_path_usage_with_after(
+        &mut self,
+        index: usize,
+        before: Option<VirtualStat>,
+        after: Option<VirtualStat>,
+    ) {
         let Some(usage) = self.mounts[index].cached_usage.as_mut() else {
             return;
         };
@@ -1526,11 +1582,23 @@ impl MountTable {
         if self.mounts[index].max_bytes.is_none() && self.mounts[index].max_inodes.is_none() {
             return Ok(());
         }
+        let existing = self.mounts[index].filesystem.lstat(relative_path).ok();
+        self.check_file_growth_with_existing(index, new_size, exclusive, existing.as_ref())
+    }
+
+    fn check_file_growth_with_existing(
+        &mut self,
+        index: usize,
+        new_size: u64,
+        exclusive: bool,
+        existing: Option<&VirtualStat>,
+    ) -> VfsResult<()> {
+        if self.mounts[index].max_bytes.is_none() && self.mounts[index].max_inodes.is_none() {
+            return Ok(());
+        }
         let usage = self.cached_usage(index)?;
-        let mount = &mut self.mounts[index];
-        let existing = mount.filesystem.lstat(relative_path).ok();
+        let mount = &self.mounts[index];
         let existing_size = existing
-            .as_ref()
             .filter(|stat| !stat.is_directory)
             .map_or(0, |stat| stat.size);
         let resulting = FileSystemUsage {
@@ -1546,6 +1614,24 @@ impl MountTable {
             return Ok(());
         }
         check_usage_limits(&resulting, mount.max_bytes, mount.max_inodes)
+    }
+
+    fn update_cached_file_resize(
+        &mut self,
+        index: usize,
+        before: Option<&VirtualStat>,
+        new_size: u64,
+    ) {
+        let Some(before) = before.filter(|stat| !stat.is_directory) else {
+            return;
+        };
+        let Some(usage) = self.mounts[index].cached_usage.as_mut() else {
+            return;
+        };
+        usage.total_bytes = usage
+            .total_bytes
+            .saturating_sub(before.size)
+            .saturating_add(new_size);
     }
 
     fn check_inode_growth(&mut self, index: usize, added: usize) -> VfsResult<()> {
@@ -1579,6 +1665,19 @@ impl MountTable {
 
     fn resolve_index(&self, full_path: &str) -> VfsResult<(usize, String)> {
         let normalized = normalize_path(full_path);
+        if normalized != "/" {
+            let first_component = normalized[1..]
+                .split_once('/')
+                .map_or(&normalized[1..], |(component, _)| component);
+            if !self.non_root_mount_roots.contains(first_component) {
+                let root_index = self
+                    .mount_indices
+                    .get("/")
+                    .copied()
+                    .expect("mount table always retains its root mount");
+                return Ok((root_index, normalized));
+            }
+        }
         let mut candidate = normalized.as_str();
         loop {
             if let Some(index) = self.mount_indices.get(candidate).copied() {
@@ -1616,6 +1715,14 @@ impl MountTable {
                 .iter()
                 .enumerate()
                 .map(|(index, mount)| (mount.path.clone(), index)),
+        );
+        self.non_root_mount_roots.clear();
+        self.non_root_mount_roots.extend(
+            self.mounts
+                .iter()
+                .filter(|mount| mount.path != "/")
+                .filter_map(|mount| mount.path[1..].split('/').next())
+                .map(str::to_owned),
         );
     }
 
@@ -1700,6 +1807,9 @@ impl MountTable {
     fn resolve_link_leaf_index(&self, path: &str) -> VfsResult<(usize, String)> {
         let normalized = normalize_path(path);
         let raw = self.resolve_index(&normalized)?;
+        if self.mounts[raw.0].filesystem.lstat_exact(&raw.1).is_some() {
+            return Ok(raw);
+        }
         if raw.1 == "/" {
             return Ok(raw);
         }
@@ -1717,6 +1827,9 @@ impl MountTable {
     fn resolve_content_index(&self, path: &str) -> VfsResult<(usize, String)> {
         let normalized = normalize_path(path);
         let raw = self.resolve_index(&normalized)?;
+        if self.mounts[raw.0].filesystem.stat_exact(&raw.1).is_some() {
+            return Ok(raw);
+        }
         match self.realpath(&normalized) {
             Ok(resolved) if resolved != normalized => self.resolve_index(&resolved),
             Ok(_) | Err(_) => Ok(raw),
@@ -1927,12 +2040,11 @@ impl VirtualFileSystem for MountTable {
     fn create_file_exclusive(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
         let content = content.into();
         let (index, relative_path) = self.resolve_writable_index(path)?;
-        let before = self.mounts[index].filesystem.lstat(&relative_path).ok();
         self.check_file_growth(index, &relative_path, content.len() as u64, true)?;
         self.mounts[index]
             .filesystem
             .create_file_exclusive(&relative_path, content)?;
-        self.update_cached_path_usage(index, before, &relative_path);
+        self.update_cached_path_usage(index, None, &relative_path);
         Ok(())
     }
 
@@ -1944,13 +2056,28 @@ impl VirtualFileSystem for MountTable {
     ) -> VfsResult<()> {
         let content = content.into();
         let (index, relative_path) = self.resolve_writable_index(path)?;
-        let before = self.mounts[index].filesystem.lstat(&relative_path).ok();
         self.check_file_growth(index, &relative_path, content.len() as u64, true)?;
         self.mounts[index]
             .filesystem
             .create_file_exclusive_with_mode(&relative_path, content, mode)?;
-        self.update_cached_path_usage(index, before, &relative_path);
+        self.update_cached_path_usage(index, None, &relative_path);
         Ok(())
+    }
+
+    fn create_file_exclusive_with_mode_stat(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        let content = content.into();
+        let (index, relative_path) = self.resolve_writable_index(path)?;
+        self.check_file_growth(index, &relative_path, content.len() as u64, true)?;
+        let stat = self.mounts[index]
+            .filesystem
+            .create_file_exclusive_with_mode_stat(&relative_path, content, mode)?;
+        self.update_cached_path_usage_with_after(index, None, Some(stat.clone()));
+        Ok(stat)
     }
 
     fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
@@ -2064,6 +2191,10 @@ impl VirtualFileSystem for MountTable {
     }
 
     fn stat(&mut self, path: &str) -> VfsResult<VirtualStat> {
+        let raw = self.resolve_index(path)?;
+        if let Some(stat) = self.mounts[raw.0].filesystem.stat_exact(&raw.1) {
+            return Ok(stat);
+        }
         let (index, relative_path) = self.resolve_content_index(path)?;
         self.mounts[index].filesystem.stat(&relative_path)
     }
@@ -2241,8 +2372,20 @@ impl VirtualFileSystem for MountTable {
     }
 
     fn lstat(&self, path: &str) -> VfsResult<VirtualStat> {
+        let raw = self.resolve_index(path)?;
+        if let Some(stat) = self.mounts[raw.0].filesystem.lstat_exact(&raw.1) {
+            return Ok(stat);
+        }
         let (index, relative_path) = self.resolve_link_leaf_index(path)?;
         self.mounts[index].filesystem.lstat(&relative_path)
+    }
+
+    fn lstat_exact(&self, path: &str) -> Option<VirtualStat> {
+        let (index, relative_path) = self.resolve_index(path).ok()?;
+        self.mounts[index]
+            .filesystem
+            .as_ref()
+            .lstat_exact(&relative_path)
     }
 
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
@@ -2496,16 +2639,12 @@ impl VirtualFileSystem for MountTable {
         self.ensure_writable(index, path)?;
         let before = self.mounts[index].filesystem.lstat(&relative_path).ok();
         let current_size = before.as_ref().map_or(0, |stat| stat.size);
-        self.check_file_growth(
-            index,
-            &relative_path,
-            current_size.max(offset.saturating_add(content.len() as u64)),
-            false,
-        )?;
+        let new_size = current_size.max(offset.saturating_add(content.len() as u64));
+        self.check_file_growth_with_existing(index, new_size, false, before.as_ref())?;
         self.mounts[index]
             .filesystem
             .pwrite(&relative_path, content, offset)?;
-        self.update_cached_path_usage(index, before, &relative_path);
+        self.update_cached_file_resize(index, before.as_ref(), new_size);
         Ok(())
     }
 }
@@ -2556,6 +2695,16 @@ fn check_usage_limits(
 }
 
 fn normalize_path(path: &str) -> String {
+    if path.starts_with('/')
+        && (path == "/"
+            || (!path.ends_with('/')
+                && path[1..].split('/').all(|component| {
+                    !component.is_empty() && component != "." && component != ".."
+                })))
+    {
+        return path.to_owned();
+    }
+
     let mut segments = Vec::new();
     for component in Path::new(path).components() {
         match component {
@@ -2617,4 +2766,31 @@ fn basename(path: &str) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| String::from("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_path;
+
+    #[test]
+    fn normalize_path_fast_path_matches_component_normalization() {
+        for (input, expected) in [
+            ("/", "/"),
+            (
+                "/workspace/node_modules/hono",
+                "/workspace/node_modules/hono",
+            ),
+            (
+                "workspace/node_modules/hono",
+                "/workspace/node_modules/hono",
+            ),
+            ("/workspace//hono", "/workspace/hono"),
+            ("/workspace/./hono/", "/workspace/hono"),
+            ("/workspace/pkg/../hono", "/workspace/hono"),
+            ("../../workspace", "/workspace"),
+            ("", "/"),
+        ] {
+            assert_eq!(normalize_path(input), expected, "input {input:?}");
+        }
+    }
 }

@@ -39,9 +39,10 @@
 			"argumentTypes": [
 				"specifier: string",
 				"fromDir: string",
-				"mode?: \"require\" | \"import\""
+				"mode?: \"require\" | \"import\"",
+				"includeModule?: boolean"
 			],
-			"returnType": "string | null",
+			"returnType": "string | { resolved: string; format: \"module\" | \"commonjs\" | \"json\"; source: string | null } | null",
 			"names": [
 				"_resolveModule",
 				"_resolveModuleSync"
@@ -50,9 +51,10 @@
 		{
 			"convention": "syncPromise",
 			"argumentTypes": [
-				"path: string"
+				"path: string",
+				"includeFormat?: boolean"
 			],
-			"returnType": "string | null",
+			"returnType": "string | { format: \"module\" | \"commonjs\" | \"json\"; source: string | null } | null",
 			"names": [
 				"_loadFile",
 				"_loadFileSync"
@@ -191,6 +193,7 @@
 				"_fsWriteFileBinaryAsync",
 				"_fsReadDirAsync",
 				"_fsMkdirAsync",
+				"_fsMkdirStatAsync",
 				"_fsRmdirAsync",
 				"_fsAccessAsync",
 				"_fsStatAsync",
@@ -204,7 +207,10 @@
 				"_fsLstatAsync",
 				"_fsTruncateAsync",
 				"_fsUtimesAsync",
-				"_fsLutimesAsync"
+				"_fsLutimesAsync",
+				"_fsOpenAsync",
+				"_fsCloseAsync",
+				"_fsWriteAsync"
 			]
 		},
 		{
@@ -460,8 +466,8 @@
 		"_benchNetTcpMetricsResetRaw": 65536,
 		"_benchNetTcpMetricsSnapshotRaw": 65536,
 		"_loadPolyfill": 4194304,
-		"_resolveModule": 65536,
-		"_resolveModuleSync": 65536,
+		"_resolveModule": 16777216,
+		"_resolveModuleSync": 16777216,
 		"_loadFile": 16777216,
 		"_loadFileSync": 16777216,
 		"_moduleFormat": 4096,
@@ -829,12 +835,28 @@
 			"method": "fs.promises.lutimes",
 			"translateArgs": false
 		},
+		"_fsOpenAsync": {
+			"method": "fs.open",
+			"translateArgs": false
+		},
+		"_fsCloseAsync": {
+			"method": "fs.close",
+			"translateArgs": false
+		},
+		"_fsWriteAsync": {
+			"method": "fs.write",
+			"translateArgs": false
+		},
 		"_fsMkdir": {
 			"method": "fs.mkdirSync",
 			"translateArgs": false
 		},
 		"_fsMkdirAsync": {
 			"method": "fs.promises.mkdir",
+			"translateArgs": false
+		},
+		"_fsMkdirStatAsync": {
+			"method": "fs.promises.mkdirStat",
 			"translateArgs": false
 		},
 		"_fsReadDir": {

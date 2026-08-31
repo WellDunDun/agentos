@@ -1164,7 +1164,7 @@ pub fn run_snapshot_consolidated_checks() {
             let iife_code = r#"
                     (function() {
                         // Verify bridge functions exist (like ivm-compat shim)
-                        var syncKeys = ['_log', '_error', '_resolveModule', '_loadFile', '_moduleFormat',
+                    var syncKeys = ['_log', '_error', '_resolveModule', '_loadFile', '_moduleFormat',
                             '_cryptoRandomFill', '_fsReadFile', '_fsWriteFile',
                             '_childProcessSpawnStart', '_childProcessPoll', '_childProcessSpawnSync'];
                         var asyncKeys = ['_dynamicImport', '_scheduleTimer',
@@ -1243,8 +1243,8 @@ pub fn run_snapshot_consolidated_checks() {
         let iife_code = r#"
                 (function() {
                     // Verify all sync bridge functions are registered as stubs
-                    var syncFns = ['_log', '_error', '_resolveModule', '_loadFile',
-                        '_moduleFormat', '_loadPolyfill', '_cryptoRandomFill', '_cryptoRandomUUID',
+                var syncFns = ['_log', '_error', '_resolveModule', '_loadFile',
+					'_moduleFormat', '_loadPolyfill', '_cryptoRandomFill', '_cryptoRandomUUID',
                         '_fsReadFile', '_fsWriteFile', '_fsReadFileBinary',
                         '_fsWriteFileBinary', '_fsReadDir', '_fsMkdir', '_fsRmdir',
                         '_fsExists', '_fsStat', '_fsUnlink', '_fsRename', '_fsChmod',

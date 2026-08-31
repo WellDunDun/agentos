@@ -1664,6 +1664,7 @@ where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    agentos_execution::record_sync_bridge_request_observed(request.id, &request.method);
     if request.method == "dgram.poll" {
         let response =
             service_owned_javascript_dgram_poll::<B>(vm, process_id, child_path, &request).await;

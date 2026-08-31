@@ -372,6 +372,10 @@ impl<F> PermissionedFileSystem<F> {
         self.permissions = permissions;
     }
 
+    pub fn filesystem_unrestricted(&self) -> bool {
+        self.permissions.filesystem_unrestricted
+    }
+
     fn check(&self, op: FsOperation, path: &str) -> VfsResult<()> {
         validate_path(path)?;
         // Standard emulated character devices (/dev/null, /dev/zero, /dev/urandom,
@@ -380,6 +384,13 @@ impl<F> PermissionedFileSystem<F> {
         // the VM file-permission policy so guest fs ops on them (readFileSync /
         // existsSync / redirects) behave like native Linux regardless of policy.
         if crate::device_layer::is_standard_device_path(path) {
+            return Ok(());
+        }
+        // This flag is set only for an unconditional allow policy. Avoid
+        // allocating an FsAccessRequest and invoking its Arc callback for
+        // every VFS operation while preserving validation above. Rule-based
+        // policies never set the flag and continue through resolved subjects.
+        if self.permissions.filesystem_unrestricted {
             return Ok(());
         }
         let Some(check) = self.permissions.filesystem.as_ref() else {
@@ -527,17 +538,26 @@ impl<F: VirtualFileSystem> PermissionedFileSystem<F> {
     }
 
     fn check_subject(&self, op: FsOperation, path: &str) -> VfsResult<()> {
+        if self.permissions.filesystem_unrestricted {
+            return self.check(op, path);
+        }
         let subject = self.permission_subject(op, path)?;
         self.check(op, &subject)
     }
 
     fn check_existing_subject(&self, op: FsOperation, path: &str) -> VfsResult<()> {
+        if self.permissions.filesystem_unrestricted {
+            return self.check(op, path);
+        }
         validate_path(path)?;
         let subject = self.resolved_existing_path(path)?;
         self.check(op, &subject)
     }
 
     fn check_destination_subject(&self, op: FsOperation, path: &str) -> VfsResult<()> {
+        if self.permissions.filesystem_unrestricted {
+            return self.check(op, path);
+        }
         validate_path(path)?;
         let subject = self.resolved_destination_path(path)?;
         self.check(op, &subject)
@@ -592,6 +612,28 @@ impl<F: VirtualFileSystem> VirtualFileSystem for PermissionedFileSystem<F> {
     fn create_file_exclusive(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
         self.check_subject(FsOperation::Write, path)?;
         self.inner.create_file_exclusive(path, content)
+    }
+
+    fn create_file_exclusive_with_mode(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<()> {
+        self.check_subject(FsOperation::Write, path)?;
+        self.inner
+            .create_file_exclusive_with_mode(path, content, mode)
+    }
+
+    fn create_file_exclusive_with_mode_stat(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        self.check_subject(FsOperation::Write, path)?;
+        self.inner
+            .create_file_exclusive_with_mode_stat(path, content, mode)
     }
 
     fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
@@ -670,6 +712,10 @@ impl<F: VirtualFileSystem> VirtualFileSystem for PermissionedFileSystem<F> {
         // final component, matching `lstat`/`readlink` semantics). A lexical
         // check would let a symlink whose parent resolves into a denied prefix
         // disclose link targets of permission-denied paths.
+        if self.permissions.filesystem_unrestricted {
+            self.check(FsOperation::ReadLink, path)?;
+            return self.inner.read_link(path);
+        }
         validate_path(path)?;
         let subject = self.resolved_destination_path(path)?;
         self.check(FsOperation::ReadLink, &subject)?;
@@ -680,6 +726,10 @@ impl<F: VirtualFileSystem> VirtualFileSystem for PermissionedFileSystem<F> {
         // Authorize the parent-symlink-resolved path (see `read_link`); a
         // lexical check would leak metadata (size/mode/mtime/inode) of files
         // under a permission-denied prefix reached via a symlinked parent.
+        if self.permissions.filesystem_unrestricted {
+            self.check(FsOperation::Stat, path)?;
+            return self.inner.lstat(path);
+        }
         validate_path(path)?;
         let subject = self.resolved_destination_path(path)?;
         self.check(FsOperation::Stat, &subject)?;

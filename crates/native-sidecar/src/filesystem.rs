@@ -2,7 +2,7 @@
 
 use crate::execution::{
     host_path_from_runtime_guest_mappings, is_protected_agentos_shadow_sync_path,
-    sync_active_process_host_writes_to_kernel,
+    javascript_sync_rpc_error_code, sync_active_process_host_writes_to_kernel,
 };
 use crate::protocol::{
     GuestFilesystemCallRequest, GuestFilesystemOperation, GuestFilesystemResultResponse,
@@ -1274,7 +1274,8 @@ impl ModuleFsReader for ProcessModuleFsReader<'_> {
 /// VFS. Routed here from `service_javascript_sync_rpc` for the
 /// `__resolve_module` / `__load_file` / `__module_format` /
 /// `__batch_resolve_modules` methods (mapped from the guest bridge's
-/// `_resolveModule` / `_loadFile` / `_moduleFormat` / `_batchResolveModules`).
+/// `_resolveModule` / `_loadFile` / `_moduleFormat` /
+/// `_batchResolveModules`).
 /// The `/opt/agentos/pkgs/<name>/<version>` root containing `guest_entrypoint`,
 /// when the entrypoint lives inside a projected package. `current` is a valid
 /// version segment here — the resolver canonicalizes it through the kernel.
@@ -1342,14 +1343,67 @@ pub(crate) fn service_javascript_module_sync_rpc(
                 if resolved.is_none() && std::env::var("AGENTOS_MODULE_READER_TRACE").is_ok() {
                     eprintln!("kernel-resolve MISS: {specifier} from {parent} mode={mode:?}");
                 }
-                resolved.map(Value::String).unwrap_or(Value::Null)
+                if request
+                    .args
+                    .get(3)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    match resolved {
+                        Some(resolved) => match resolver.module_format(&resolved) {
+                            Some(format) if format == LocalResolvedModuleFormat::Module => {
+                                json!({
+                                    "resolved": resolved,
+                                    "format": format.as_str(),
+                                    "source": Value::Null,
+                                })
+                            }
+                            Some(format) => resolver
+                                .load_file(&resolved)
+                                .map(|source| {
+                                    json!({
+                                        "resolved": resolved,
+                                        "format": format.as_str(),
+                                        "source": source,
+                                    })
+                                })
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        },
+                        None => Value::Null,
+                    }
+                } else {
+                    resolved.map(Value::String).unwrap_or(Value::Null)
+                }
             }
             "__load_file" | "_loadFile" | "_loadFileSync" => {
                 let path = javascript_sync_rpc_arg_str(&request.args, 0, "module load path")?;
-                resolver
-                    .load_file(path)
-                    .map(Value::String)
-                    .unwrap_or(Value::Null)
+                if request
+                    .args
+                    .get(1)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    match resolver.module_format(path) {
+                        Some(format) => {
+                            let source = if format == LocalResolvedModuleFormat::Module {
+                                Value::Null
+                            } else {
+                                resolver
+                                    .load_file(path)
+                                    .map(Value::String)
+                                    .unwrap_or(Value::Null)
+                            };
+                            json!({ "format": format.as_str(), "source": source })
+                        }
+                        None => Value::Null,
+                    }
+                } else {
+                    resolver
+                        .load_file(path)
+                        .map(Value::String)
+                        .unwrap_or(Value::Null)
+                }
             }
             "__module_format" | "_moduleFormat" => {
                 let path = javascript_sync_rpc_arg_str(&request.args, 0, "module format path")?;
@@ -1384,6 +1438,7 @@ struct FsSyncPhaseStats {
 }
 
 static FS_SYNC_PHASES: OnceLock<Mutex<BTreeMap<String, FsSyncPhaseStats>>> = OnceLock::new();
+static FS_SYNC_PHASE_RECORDS: AtomicU64 = AtomicU64::new(0);
 
 struct FsSyncPhaseTimer<'a> {
     method: &'a str,
@@ -1428,6 +1483,9 @@ fn record_fs_sync_phase(method: &str, elapsed_ns: u128) {
     let Some(path) = env::var_os("AGENTOS_FS_SYNC_PHASES_FILE") else {
         return;
     };
+    if FS_SYNC_PHASE_RECORDS.fetch_add(1, Ordering::Relaxed) % 512 != 511 {
+        return;
+    }
     let mut output = String::new();
     for (method, stats) in phases.iter() {
         let total_us = stats.total_ns / 1_000;
@@ -1461,6 +1519,7 @@ fn fs_sync_request_marks_host_write_dirty(
         | "fs.mkdirSync"
         | "fs.mknodSync"
         | "fs.promises.mkdir"
+        | "fs.promises.mkdirStat"
         | "fs.copyFileSync"
         | "fs.promises.copyFile"
         | "fs.symlinkSync"
@@ -1528,6 +1587,37 @@ pub(crate) fn service_javascript_fs_read_sync_rpc(
         None => kernel.fd_read(EXECUTION_DRIVER_NAME, kernel_pid, fd, length),
     }
     .map_err(kernel_error)
+}
+
+fn service_javascript_fs_mkdir(
+    kernel: &mut SidecarKernel,
+    process: &mut ActiveProcess,
+    kernel_pid: u32,
+    path: &str,
+    recursive: bool,
+    mode: Option<u32>,
+) -> Result<(), SidecarError> {
+    match mapped_runtime_host_path(kernel, process, path, true) {
+        Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
+            if mapped_runtime_relative_path(&mapped_host)? == Path::new(".") {
+                create_mapped_runtime_root_directory(&mapped_host, recursive)?;
+            } else if recursive {
+                ensure_mapped_runtime_parent_dirs(&mapped_host, "fs.mkdir")?;
+                let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.mkdir")?;
+                create_mapped_runtime_directory(&parent, path, true)?;
+            } else {
+                let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.mkdir")?;
+                create_mapped_runtime_directory(&parent, path, false)?;
+            }
+            Ok(())
+        }
+        Some(MappedRuntimeHostAccess::ReadOnly(_)) => {
+            Err(read_only_mapped_runtime_host_path_error(path))
+        }
+        None => kernel
+            .mkdir_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path, recursive, mode)
+            .map_err(kernel_error),
+    }
 }
 
 pub(crate) fn service_javascript_fs_sync_rpc(
@@ -2235,45 +2325,56 @@ pub(crate) fn service_javascript_fs_sync_rpc(
             service_javascript_fs_readdir_entries(kernel, process, kernel_pid, path)
                 .map(javascript_sync_rpc_readdir_typed_value)
         }
-        "fs.mkdirSync" | "fs.promises.mkdir" => {
+        "fs.mkdirSync" | "fs.promises.mkdir" | "fs.promises.mkdirStat" => {
             let path =
                 javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem mkdir path")?;
             let path = path.as_str();
             let recursive =
                 javascript_sync_rpc_option_bool(&request.args, 1, "recursive").unwrap_or(false);
-            match mapped_runtime_host_path(kernel, process, path, true) {
-                Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
-                    if mapped_runtime_relative_path(&mapped_host)? == Path::new(".") {
-                        create_mapped_runtime_root_directory(&mapped_host, recursive)?;
-                    } else {
-                        if recursive {
-                            ensure_mapped_runtime_parent_dirs(&mapped_host, "fs.mkdir")?;
-                            let parent =
-                                open_mapped_runtime_parent_beneath(&mapped_host, "fs.mkdir")?;
-                            create_mapped_runtime_directory(&parent, path, true)?;
-                        } else {
-                            let parent =
-                                open_mapped_runtime_parent_beneath(&mapped_host, "fs.mkdir")?;
-                            create_mapped_runtime_directory(&parent, path, false)?;
-                        }
-                    }
-                    return Ok(Value::Null);
-                }
-                Some(MappedRuntimeHostAccess::ReadOnly(_)) => {
-                    return Err(read_only_mapped_runtime_host_path_error(path));
-                }
-                None => {}
+            let mode = javascript_sync_rpc_option_u32(&request.args, 1, "mode")?;
+            if request.method == "fs.promises.mkdirStat"
+                && !recursive
+                && mapped_runtime_host_path(kernel, process, path, true).is_none()
+            {
+                return kernel
+                    .mkdir_stat_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path, mode)
+                    .map(|stat| match stat {
+                        Some(stat) => json!({
+                            "created": false,
+                            "stat": javascript_sync_rpc_stat_value(stat),
+                        }),
+                        None => json!({ "created": true }),
+                    })
+                    .map_err(kernel_error);
             }
-            kernel
-                .mkdir_for_process(
-                    EXECUTION_DRIVER_NAME,
-                    kernel_pid,
-                    path,
-                    recursive,
-                    javascript_sync_rpc_option_u32(&request.args, 1, "mode")?,
-                )
-                .map(|()| Value::Null)
-                .map_err(kernel_error)
+            let mkdir_result =
+                service_javascript_fs_mkdir(kernel, process, kernel_pid, path, recursive, mode);
+            if request.method != "fs.promises.mkdirStat" {
+                return mkdir_result.map(|()| Value::Null);
+            }
+            match mkdir_result {
+                Ok(()) => Ok(json!({ "created": true })),
+                Err(error) if javascript_sync_rpc_error_code(&error) == "EEXIST" => {
+                    let stat = if let Some(mapped_host) =
+                        mapped_runtime_host_path_for_read(kernel, process, path)
+                    {
+                        materialize_mapped_host_path_from_kernel(
+                            kernel,
+                            kernel_pid,
+                            path,
+                            &mapped_host,
+                        )?;
+                        mapped_runtime_symlink_metadata(&mapped_host, "fs.lstat")?.to_value()
+                    } else {
+                        kernel
+                            .lstat_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path)
+                            .map(javascript_sync_rpc_stat_value)
+                            .map_err(kernel_error)?
+                    };
+                    Ok(json!({ "created": false, "stat": stat }))
+                }
+                Err(error) => Err(error),
+            }
         }
         "fs.mknodSync" => {
             let path =

@@ -2,13 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::metrics::{BufferMetricClass, ResourceMetricClass, RuntimeMetrics};
+use smallvec::SmallVec;
 
 /// Low-cardinality resource classes used by the sidecar admission policy.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
 pub enum ResourceClass {
     Capabilities,
     ReadyHandles,
@@ -107,6 +109,10 @@ impl ResourceClass {
             Self::Http2EventBytes => "http2EventBytes",
         }
     }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,21 +165,22 @@ pub struct ResourceUsage {
 
 #[derive(Debug, Default)]
 struct CounterState {
-    used: usize,
-    warning_active: bool,
+    used: AtomicUsize,
+    warning_active: AtomicBool,
 }
 
 #[derive(Debug)]
 struct LedgerState {
-    counters: BTreeMap<ResourceClass, CounterState>,
+    counters: [CounterState; ResourceClass::ALL.len()],
 }
 
 #[derive(Debug)]
 struct LedgerInner {
     scope: String,
     limits: BTreeMap<ResourceClass, ResourceLimit>,
-    state: Mutex<LedgerState>,
+    state: LedgerState,
     capacity_changed: tokio::sync::Notify,
+    capacity_waiters: AtomicUsize,
     integrity_failed: AtomicBool,
     metrics: Option<RuntimeMetrics>,
 }
@@ -220,10 +227,11 @@ impl ResourceLedger {
             inner: Arc::new(LedgerInner {
                 scope: scope.into(),
                 limits: limits.into_iter().collect(),
-                state: Mutex::new(LedgerState {
-                    counters: BTreeMap::new(),
-                }),
+                state: LedgerState {
+                    counters: std::array::from_fn(|_| CounterState::default()),
+                },
                 capacity_changed: tokio::sync::Notify::new(),
+                capacity_waiters: AtomicUsize::new(0),
                 integrity_failed: AtomicBool::new(false),
                 metrics,
             }),
@@ -242,7 +250,11 @@ impl ResourceLedger {
         resource: ResourceClass,
         amount: usize,
     ) -> Result<Reservation, LimitError> {
-        let mut allocations = Vec::with_capacity(if self.parent.is_some() { 2 } else { 1 });
+        // Production ledgers have exactly two scopes (process -> VM). Keep
+        // those ownership records inline so every short-lived reservation does
+        // not allocate a heap Vec; SmallVec still preserves arbitrary-depth
+        // hierarchies for tests or future scopes.
+        let mut allocations = SmallVec::<[Allocation; 2]>::new();
         if let Some(parent) = &self.parent {
             parent.reserve_into(resource, amount, &mut allocations)?;
         }
@@ -268,7 +280,7 @@ impl ResourceLedger {
         &self,
         resource: ResourceClass,
         amount: usize,
-        allocations: &mut Vec<Allocation>,
+        allocations: &mut SmallVec<[Allocation; 2]>,
     ) -> Result<(), LimitError> {
         if let Some(parent) = &self.parent {
             parent.reserve_into(resource, amount, allocations)?;
@@ -291,48 +303,39 @@ impl ResourceLedger {
         if amount == 0 {
             return Ok(());
         }
-        let mut state = self.inner.state.lock().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "ERR_AGENTOS_RESOURCE_LEDGER_POISONED: recovering scope={} resource={}",
-                self.inner.scope,
-                resource.name()
-            );
-            poisoned.into_inner()
-        });
-        let counter = state.counters.entry(resource).or_default();
-        let requested_total = counter.used.checked_add(amount);
-        if let Some(limit) = self.inner.limits.get(&resource) {
-            if requested_total.is_none_or(|total| total > limit.maximum) {
-                return Err(LimitError {
+        let counter = &self.inner.state.counters[resource.index()];
+        let limit = self.inner.limits.get(&resource);
+        let used = counter
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let requested_total = used.saturating_add(amount);
+                if limit.is_some_and(|limit| requested_total > limit.maximum) {
+                    return None;
+                }
+                Some(requested_total)
+            })
+            .map_err(|used| {
+                let limit = limit.expect("only a configured resource limit can reject admission");
+                LimitError {
                     scope: self.inner.scope.clone(),
                     resource,
-                    used: counter.used,
+                    used,
                     requested: amount,
                     limit: limit.maximum,
                     config_path: limit.config_path.clone(),
-                });
-            }
-        }
-        counter.used = requested_total.unwrap_or(usize::MAX);
-        maybe_warn(&self.inner, resource, counter);
-        observe_usage(&self.inner, resource, counter.used);
+                }
+            })?
+            .saturating_add(amount);
+        maybe_warn(&self.inner, resource, counter, used);
+        observe_usage(&self.inner, resource, used);
         Ok(())
     }
 
     pub fn usage(&self, resource: ResourceClass) -> ResourceUsage {
-        let state = self.inner.state.lock().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "ERR_AGENTOS_RESOURCE_LEDGER_POISONED: recovering scope={} resource={}",
-                self.inner.scope,
-                resource.name()
-            );
-            poisoned.into_inner()
-        });
         ResourceUsage {
-            used: state
-                .counters
-                .get(&resource)
-                .map_or(0, |counter| counter.used),
+            used: self.inner.state.counters[resource.index()]
+                .used
+                .load(Ordering::Acquire),
             limit: self.inner.limits.get(&resource).map(|limit| limit.maximum),
         }
     }
@@ -354,18 +357,9 @@ impl ResourceLedger {
         if amount == 0 {
             return true;
         }
-        let state = self.inner.state.lock().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "ERR_AGENTOS_RESOURCE_LEDGER_POISONED: recovering capacity probe scope={} resource={}",
-                self.inner.scope,
-                resource.name()
-            );
-            poisoned.into_inner()
-        });
-        let used = state
-            .counters
-            .get(&resource)
-            .map_or(0, |counter| counter.used);
+        let used = self.inner.state.counters[resource.index()]
+            .used
+            .load(Ordering::Acquire);
         self.inner.limits.get(&resource).is_none_or(|limit| {
             used.checked_add(amount)
                 .is_some_and(|total| total <= limit.maximum)
@@ -373,14 +367,11 @@ impl ResourceLedger {
     }
 
     pub fn is_zero(&self) -> bool {
-        let state = self.inner.state.lock().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "ERR_AGENTOS_RESOURCE_LEDGER_POISONED: recovering scope={}",
-                self.inner.scope
-            );
-            poisoned.into_inner()
-        });
-        state.counters.values().all(|counter| counter.used == 0)
+        self.inner
+            .state
+            .counters
+            .iter()
+            .all(|counter| counter.used.load(Ordering::Acquire) == 0)
     }
 
     pub fn integrity_ok(&self) -> bool {
@@ -390,6 +381,11 @@ impl ResourceLedger {
     /// Wait without polling until any owner releases capacity. Callers must
     /// retry their full multi-resource admission after this notification.
     pub async fn capacity_changed(&self) {
+        let _local_waiter = CapacityWaiter::new(&self.inner);
+        let _parent_waiter = self
+            .parent
+            .as_ref()
+            .map(|parent| CapacityWaiter::new(&parent.inner));
         let local_changed = self.inner.capacity_changed.notified();
         if let Some(parent) = &self.parent {
             let parent_changed = parent.inner.capacity_changed.notified();
@@ -414,6 +410,11 @@ impl ResourceLedger {
             // Arm both accounting scopes before admission so a concurrent
             // release cannot be missed. Ledgers are currently process -> VM;
             // flatten this wait set if another hierarchy level is introduced.
+            let _local_waiter = CapacityWaiter::new(&self.inner);
+            let _parent_waiter = self
+                .parent
+                .as_ref()
+                .map(|parent| CapacityWaiter::new(&parent.inner));
             let local_changed = self.inner.capacity_changed.notified();
             let parent_changed = self
                 .parent
@@ -437,21 +438,24 @@ impl ResourceLedger {
     }
 }
 
-fn maybe_warn(inner: &LedgerInner, resource: ResourceClass, counter: &mut CounterState) {
+fn maybe_warn(inner: &LedgerInner, resource: ResourceClass, counter: &CounterState, used: usize) {
     let Some(limit) = inner.limits.get(&resource) else {
         return;
     };
     // Integer comparisons avoid rounding and make zero impossible to treat as
     // near-limit. The warning rearms only after usage falls below 70%.
-    let near =
-        counter.used != 0 && counter.used.saturating_mul(100) >= limit.maximum.saturating_mul(80);
-    if near && !counter.warning_active {
-        counter.warning_active = true;
+    let near = used != 0 && used.saturating_mul(100) >= limit.maximum.saturating_mul(80);
+    if near
+        && counter
+            .warning_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
         eprintln!(
             "WARN_AGENTOS_RESOURCE_NEAR_LIMIT: scope={} resource={} used={} limit={} config={}",
             inner.scope,
             resource.name(),
-            counter.used,
+            used,
             limit.maximum,
             limit.config_path
         );
@@ -465,41 +469,59 @@ struct Allocation {
     amount: usize,
 }
 
+struct CapacityWaiter<'a> {
+    ledger: &'a LedgerInner,
+}
+
+impl<'a> CapacityWaiter<'a> {
+    fn new(ledger: &'a LedgerInner) -> Self {
+        ledger.capacity_waiters.fetch_add(1, Ordering::AcqRel);
+        Self { ledger }
+    }
+}
+
+impl Drop for CapacityWaiter<'_> {
+    fn drop(&mut self) {
+        let previous = self.ledger.capacity_waiters.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "capacity waiter count cannot underflow");
+    }
+}
+
 fn release_allocation(allocation: &Allocation) {
-    let mut state = allocation.ledger.state.lock().unwrap_or_else(|poisoned| {
-        eprintln!(
-            "ERR_AGENTOS_RESOURCE_LEDGER_POISONED: recovering release scope={} resource={}",
-            allocation.ledger.scope,
-            allocation.resource.name()
-        );
-        poisoned.into_inner()
-    });
-    let counter = state.counters.entry(allocation.resource).or_default();
-    if allocation.amount > counter.used {
+    let counter = &allocation.ledger.state.counters[allocation.resource.index()];
+    let previous = counter
+        .used
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            Some(used.saturating_sub(allocation.amount))
+        })
+        .expect("resource release update cannot be rejected");
+    let used = previous.saturating_sub(allocation.amount);
+    if allocation.amount > previous {
         eprintln!(
             "ERR_AGENTOS_RESOURCE_ACCOUNTING_UNDERFLOW: scope={} resource={} used={} release={}",
             allocation.ledger.scope,
             allocation.resource.name(),
-            counter.used,
+            previous,
             allocation.amount
         );
         allocation
             .ledger
             .integrity_failed
             .store(true, Ordering::Release);
-        counter.used = 0;
-    } else {
-        counter.used -= allocation.amount;
     }
     if let Some(limit) = allocation.ledger.limits.get(&allocation.resource) {
-        if counter.used.saturating_mul(100) < limit.maximum.saturating_mul(70) {
-            counter.warning_active = false;
+        if used.saturating_mul(100) < limit.maximum.saturating_mul(70) {
+            counter.warning_active.store(false, Ordering::Release);
         }
     }
-    observe_usage(&allocation.ledger, allocation.resource, counter.used);
-    // `notify_one` retains a permit when no waiter is currently polled, which
-    // closes the release-between-retry-and-await race.
-    allocation.ledger.capacity_changed.notify_one();
+    observe_usage(&allocation.ledger, allocation.resource, used);
+    // Waiters increment their durable count before probing admission and
+    // arming the Notify future. `notify_one` retains a permit when that future
+    // has not been polled yet, closing the release-between-retry-and-await
+    // race without writing unused permits on every uncontended release.
+    if allocation.ledger.capacity_waiters.load(Ordering::Acquire) != 0 {
+        allocation.ledger.capacity_changed.notify_one();
+    }
 }
 
 fn observe_usage(inner: &LedgerInner, resource: ResourceClass, used: usize) {
@@ -562,7 +584,7 @@ fn observe_usage(inner: &LedgerInner, resource: ResourceClass, used: usize) {
     }
 }
 
-fn release_allocations(allocations: &mut Vec<Allocation>) {
+fn release_allocations(allocations: &mut SmallVec<[Allocation; 2]>) {
     for allocation in allocations.drain(..).rev() {
         release_allocation(&allocation);
     }
@@ -574,7 +596,7 @@ fn release_allocations(allocations: &mut Vec<Allocation>) {
 pub struct Reservation {
     resource: ResourceClass,
     amount: usize,
-    allocations: Vec<Allocation>,
+    allocations: SmallVec<[Allocation; 2]>,
 }
 
 /// Cloneable ownership used when a charged payload crosses an in-process
@@ -630,7 +652,7 @@ impl Reservation {
             return None;
         }
         self.amount -= amount;
-        let mut allocations = Vec::with_capacity(self.allocations.len());
+        let mut allocations = SmallVec::new();
         for allocation in &mut self.allocations {
             allocation.amount -= amount;
             allocations.push(Allocation {
@@ -793,6 +815,63 @@ mod tests {
         assert!(vm.is_zero());
     }
 
+    #[tokio::test]
+    async fn concurrent_saturation_wakes_every_waiter_without_counter_drift() {
+        const WAITERS: usize = 32;
+        let process = Arc::new(ResourceLedger::root("process", limit(1)));
+        let vm = Arc::new(ResourceLedger::child(
+            "vm-1",
+            limit(1),
+            Arc::clone(&process),
+        ));
+        let held = vm
+            .reserve(ResourceClass::BufferedBytes, 1)
+            .expect("fill both hierarchy scopes");
+        let mut tasks = Vec::with_capacity(WAITERS);
+        for index in 0..WAITERS {
+            let vm = Arc::clone(&vm);
+            tasks.push(tokio::spawn(async move {
+                let reservation = vm
+                    .reserve_when_available(ResourceClass::BufferedBytes, 1)
+                    .await
+                    .expect("waiter admission");
+                tokio::task::yield_now().await;
+                drop(reservation);
+                index
+            }));
+        }
+
+        for _ in 0..WAITERS * 4 {
+            if vm.inner.capacity_waiters.load(Ordering::Acquire) == WAITERS
+                && process.inner.capacity_waiters.load(Ordering::Acquire) == WAITERS
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(vm.inner.capacity_waiters.load(Ordering::Acquire), WAITERS);
+        assert_eq!(
+            process.inner.capacity_waiters.load(Ordering::Acquire),
+            WAITERS
+        );
+
+        drop(held);
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut completed = Vec::with_capacity(WAITERS);
+            for task in tasks {
+                completed.push(task.await.expect("waiter task"));
+            }
+            completed
+        })
+        .await
+        .expect("capacity releases must wake the full waiter chain");
+        assert_eq!(completed.len(), WAITERS);
+        assert_eq!(vm.inner.capacity_waiters.load(Ordering::Acquire), 0);
+        assert_eq!(process.inner.capacity_waiters.load(Ordering::Acquire), 0);
+        assert!(process.is_zero());
+        assert!(vm.is_zero());
+    }
+
     #[test]
     fn accounting_underflow_latches_integrity_failure() {
         let ledger = ResourceLedger::root("vm-1", limit(1));
@@ -800,7 +879,7 @@ mod tests {
         let malformed = Reservation {
             resource: ResourceClass::BufferedBytes,
             amount: 1,
-            allocations: vec![Allocation {
+            allocations: smallvec::smallvec![Allocation {
                 ledger: inner,
                 resource: ResourceClass::BufferedBytes,
                 amount: 1,

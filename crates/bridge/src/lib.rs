@@ -677,7 +677,8 @@ mod tests {
             vec![
                 "specifier: string",
                 "fromDir: string",
-                "mode?: \"require\" | \"import\""
+                "mode?: \"require\" | \"import\"",
+                "includeModule?: boolean"
             ]
         );
         assert_eq!(
@@ -687,7 +688,10 @@ mod tests {
 
         let load_group = find_group("_loadFile");
         assert_eq!(load_group.convention, BridgeCallConvention::SyncPromise);
-        assert_eq!(load_group.argument_types, vec!["path: string"]);
+        assert_eq!(
+            load_group.argument_types,
+            vec!["path: string", "includeFormat?: boolean"]
+        );
         assert_eq!(load_group.names, vec!["_loadFile", "_loadFileSync"]);
 
         let format_group = find_group("_moduleFormat");

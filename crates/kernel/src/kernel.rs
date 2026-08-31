@@ -460,6 +460,7 @@ pub struct KernelVm<F> {
     resources: ResourceAccountant,
     filesystem_usage_cache: Option<FileSystemUsage>,
     no_posix_acl_cache: BTreeSet<(u64, u64, u64, u32, u32, u32, u32)>,
+    no_default_posix_acl_cache: BTreeSet<(u64, u64, u64, u32, u32, u32, u32)>,
     anonymous_file_usage: Arc<AnonymousFileUsage>,
     file_locks: FileLockManager,
     unnamed_files: BTreeMap<u64, UnnamedFile>,
@@ -506,7 +507,7 @@ fn cleanup_process_resources(
             })
             .unwrap_or_default();
 
-        cleanup_process_resources_test_hook();
+        cleanup_process_resources_test_hook(pid);
 
         if let Some(table) = tables.get_mut(pid) {
             for (fd, description, filetype) in &descriptors {
@@ -558,18 +559,18 @@ fn dispose_kernel_vm_resources<F>(kernel: &mut KernelVm<F>) {
 }
 
 #[cfg(test)]
-type CleanupProcessResourcesHook = Arc<dyn Fn() + Send + Sync + 'static>;
+type CleanupProcessResourcesHook = Arc<dyn Fn(u32) + Send + Sync + 'static>;
 
 #[cfg(test)]
-fn cleanup_process_resources_test_hook() {
+fn cleanup_process_resources_test_hook(pid: u32) {
     let hook = lock_or_recover(cleanup_process_resources_test_hook_slot()).clone();
     if let Some(hook) = hook {
-        hook();
+        hook(pid);
     }
 }
 
 #[cfg(not(test))]
-fn cleanup_process_resources_test_hook() {}
+fn cleanup_process_resources_test_hook(_pid: u32) {}
 
 #[cfg(test)]
 fn cleanup_process_resources_test_hook_slot() -> &'static Mutex<Option<CleanupProcessResourcesHook>>
@@ -746,6 +747,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             resources: ResourceAccountant::new(config.resources),
             filesystem_usage_cache,
             no_posix_acl_cache: BTreeSet::new(),
+            no_default_posix_acl_cache: BTreeSet::new(),
             anonymous_file_usage,
             file_locks,
             unnamed_files: BTreeMap::new(),
@@ -1568,9 +1570,17 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
 
     pub fn mkdir(&mut self, path: &str, recursive: bool) -> KernelResult<()> {
         self.assert_not_terminated()?;
+        if recursive
+            && self
+                .storage_lstat(path)?
+                .is_some_and(|stat| stat.is_directory)
+        {
+            self.reject_read_only_entry_write_path(path)?;
+            return Ok(());
+        }
         self.reject_read_only_entry_write_path(path)?;
         let created_paths = self.missing_directory_paths(path, recursive)?;
-        self.check_mkdir_limits(path, recursive)?;
+        self.check_mkdir_limits(path, recursive, created_paths.len())?;
         self.filesystem.mkdir(path, recursive)?;
         self.update_filesystem_usage_cache_for_inode_creates(path, created_paths.len());
         Ok(())
@@ -1586,6 +1596,15 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     ) -> KernelResult<()> {
         self.assert_not_terminated()?;
         self.assert_driver_owns(requester_driver, pid)?;
+        if recursive {
+            if let Some(stat) = self.storage_lstat(path)? {
+                if stat.is_directory {
+                    self.check_dac_access_with_stat(pid, path, DAC_EXECUTE, &stat)?;
+                    self.reject_read_only_entry_write_path(path)?;
+                    return Ok(());
+                }
+            }
+        }
         let created_paths = self.missing_directory_paths(path, recursive)?;
         if let Some(first_created) = created_paths.first() {
             self.check_dac_parent_access(pid, first_created, DAC_WRITE | DAC_EXECUTE)?;
@@ -1593,17 +1612,85 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             self.check_dac_access(pid, path, DAC_EXECUTE)?;
         }
         self.reject_read_only_entry_write_path(path)?;
-        self.check_mkdir_limits(path, recursive)?;
-        VirtualFileSystem::mkdir_with_mode(&mut self.filesystem, path, recursive, mode)?;
-        if !created_paths.is_empty() {
+        self.check_mkdir_limits(path, recursive, created_paths.len())?;
+        let creation_metadata = if created_paths.is_empty() {
+            None
+        } else {
             let umask = self.processes.get_umask(pid)?;
-            let mode = mode.unwrap_or(0o777);
+            let requested_mode = mode.unwrap_or(0o777);
+            let initial_mode =
+                (requested_mode & !0o777) | ((requested_mode & 0o777) & !(umask & 0o777));
+            Some((requested_mode, umask, initial_mode))
+        };
+        let create_mode = creation_metadata
+            .as_ref()
+            .map(|(_, _, initial_mode)| *initial_mode)
+            .or(mode);
+        VirtualFileSystem::mkdir_with_mode(&mut self.filesystem, path, recursive, create_mode)?;
+        if let Some((requested_mode, umask, _)) = creation_metadata {
             for created_path in &created_paths {
-                self.apply_process_creation_metadata(pid, created_path, mode, umask, true)?;
+                let created_stat = self.filesystem.lstat(created_path)?;
+                self.apply_process_creation_metadata_with_stat(
+                    pid,
+                    created_path,
+                    requested_mode,
+                    umask,
+                    true,
+                    Some(&created_stat),
+                    None,
+                )?;
             }
         }
         self.update_filesystem_usage_cache_for_inode_creates(path, created_paths.len());
         Ok(())
+    }
+
+    /// Perform a non-recursive mkdir and, when the target is already a
+    /// directory, return its lstat from the same kernel critical section.
+    /// Package extractors use the existing-directory metadata to reject
+    /// symlinks; avoiding a failed mkdir followed by another lstat preserves
+    /// that check while removing redundant VFS walks.
+    pub fn mkdir_stat_for_process(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        path: &str,
+        mode: Option<u32>,
+    ) -> KernelResult<Option<VirtualStat>> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        self.check_dac_traversal(pid, path)?;
+
+        let exact = self.exact_unrestricted_storage_stat(path, false)?;
+        let stat = exact.map_or_else(
+            || self.lstat_internal(Some(pid), path),
+            Ok::<_, KernelError>,
+        );
+        match stat {
+            Ok(stat) if stat.is_directory => {
+                let identity = self
+                    .processes
+                    .get(pid)
+                    .ok_or_else(|| KernelError::no_such_process(pid))?
+                    .identity;
+                self.check_dac_mode_with_acl(&identity, &stat, DAC_EXECUTE, path)?;
+                self.filesystem
+                    .check_path(FsOperation::Mkdir, path)
+                    .map_err(KernelError::from)?;
+                return Ok(Some(stat));
+            }
+            Ok(_) => {}
+            Err(error) if error.code() == "ENOENT" => {}
+            Err(error) => return Err(error),
+        }
+
+        match self.mkdir_for_process(requester_driver, pid, path, false, mode) {
+            Ok(()) => Ok(None),
+            Err(error) if error.code() == "EEXIST" => self
+                .lstat_for_process(requester_driver, pid, path)
+                .map(Some),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn mknod_for_process(
@@ -1681,6 +1768,9 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.assert_not_terminated()?;
         self.assert_driver_owns(requester_driver, pid)?;
         self.check_dac_traversal(pid, path)?;
+        if let Some(stat) = self.exact_unrestricted_storage_stat(path, true)? {
+            return Ok(stat);
+        }
         self.stat_internal(Some(pid), path)
     }
 
@@ -1755,6 +1845,9 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.assert_not_terminated()?;
         self.assert_driver_owns(requester_driver, pid)?;
         self.check_dac_traversal(pid, path)?;
+        if let Some(stat) = self.exact_unrestricted_storage_stat(path, false)? {
+            return Ok(stat);
+        }
         self.lstat_internal(Some(pid), path)
     }
 
@@ -2309,6 +2402,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.filesystem
             .set_xattr(path, name, value, flags, follow_symlinks)?;
         self.no_posix_acl_cache.clear();
+        self.no_default_posix_acl_cache.clear();
         Ok(())
     }
 
@@ -2376,6 +2470,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         }
         self.filesystem.remove_xattr(path, name, follow_symlinks)?;
         self.no_posix_acl_cache.clear();
+        self.no_default_posix_acl_cache.clear();
         Ok(())
     }
 
@@ -4693,9 +4788,9 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                     .get(existing_fd)
                     .ok_or_else(|| KernelError::bad_file_descriptor(existing_fd))?;
             }
-            self.resources
-                .check_fd_allocation(&self.resource_snapshot(), 1)?;
             let mut tables = lock_or_recover(&self.fd_tables);
+            self.resources
+                .check_fd_allocation_count(tables.total_open_fds(), 1)?;
             let table = tables
                 .get_mut(pid)
                 .ok_or_else(|| KernelError::no_such_process(pid))?;
@@ -4730,9 +4825,9 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             self.filesystem
                 .check_virtual_path(FsOperation::Read, path)
                 .map_err(KernelError::from)?;
-            self.resources
-                .check_fd_allocation(&self.resource_snapshot(), 1)?;
             let mut tables = lock_or_recover(&self.fd_tables);
+            self.resources
+                .check_fd_allocation_count(tables.total_open_fds(), 1)?;
             let table = tables
                 .get_mut(pid)
                 .ok_or_else(|| KernelError::no_such_process(pid))?;
@@ -4744,11 +4839,31 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             )?);
         }
 
-        if open_requires_write_access(flags) {
+        let requires_write_access = open_requires_write_access(flags);
+        if requires_write_access {
+            // Reject lexical protected paths before touching storage. Resolved
+            // aliases are checked after the initial stat, where an absent leaf
+            // beneath an exact ordinary parent can be proved safe cheaply.
+            self.reject_read_only_write_path(path)?;
+        }
+        if flags & O_CREAT != 0 {
+            let fast_open = self.try_fd_open_create_missing(pid, path, flags, mode)?;
+            if let Some(fd) = fast_open {
+                return Ok(fd);
+            }
+        }
+        let existing_stat = match self.stat_internal(Some(pid), path) {
+            Ok(stat) => Some(stat),
+            Err(error) if error.code() == "ENOENT" => None,
+            Err(error) => return Err(error),
+        };
+        let existed = existing_stat.is_some();
+        if requires_write_access
+            && (existed || !self.exact_parent_proves_unprotected_leaf_lookup(path))
+        {
             self.reject_read_only_resolved_write_path(path)?;
         }
-        let existed = self.exists_internal(Some(pid), path)?;
-        if existed {
+        let creation_parent = if let Some(stat) = existing_stat.as_ref() {
             let mut access = 0;
             if flags & (O_WRONLY | O_RDWR) != O_WRONLY {
                 access |= DAC_READ;
@@ -4756,12 +4871,14 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             if flags & (O_WRONLY | O_RDWR) != 0 || flags & O_TRUNC != 0 {
                 access |= DAC_WRITE;
             }
-            self.check_dac_access(pid, path, access)?;
+            self.check_dac_access_with_stat(pid, path, access, stat)?;
+            None
         } else if flags & O_CREAT != 0 {
-            self.check_dac_parent_access(pid, path, DAC_WRITE | DAC_EXECUTE)?;
-        }
-        if existed {
-            let stat = VirtualFileSystem::stat(&mut self.filesystem, path)?;
+            Some(self.check_dac_parent_access_with_stat(pid, path, DAC_WRITE | DAC_EXECUTE)?)
+        } else {
+            None
+        };
+        if let Some(stat) = existing_stat.as_ref() {
             if stat.mode & 0o170000 == 0o010000 {
                 if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
                     return Err(KernelError::new(
@@ -4774,11 +4891,16 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                     self.resources
                         .check_pipe_allocation(&self.resource_snapshot())?;
                 }
-                self.resources
-                    .check_fd_allocation(&self.resource_snapshot(), 1)?;
                 let timeout = self.blocking_read_timeout();
                 let pipe = self.pipes.open_named_pipe(key, path, flags, timeout)?;
                 let mut tables = lock_or_recover(&self.fd_tables);
+                if let Err(error) = self
+                    .resources
+                    .check_fd_allocation_count(tables.total_open_fds(), 1)
+                {
+                    self.pipes.close(pipe.description.id());
+                    return Err(error.into());
+                }
                 let table = tables
                     .get_mut(pid)
                     .ok_or_else(|| KernelError::no_such_process(pid))?;
@@ -4791,25 +4913,47 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 };
             }
         }
-        let (filetype, lock_target) = self.prepare_fd_open(path, flags, mode)?;
+        let creation_metadata = if flags & O_CREAT != 0 && !existed {
+            let requested_mode = mode.unwrap_or(0o666);
+            let umask = self.processes.get_umask(pid)?;
+            let initial_mode =
+                (requested_mode & !0o777) | ((requested_mode & 0o777) & !(umask & 0o777));
+            Some((requested_mode, umask, initial_mode))
+        } else {
+            None
+        };
+        let create_mode = creation_metadata
+            .as_ref()
+            .map(|(_, _, initial_mode)| *initial_mode)
+            .or(mode);
+        let (opened_stat, filetype, lock_target) =
+            self.prepare_fd_open(path, flags, create_mode, existing_stat.as_ref())?;
         let description_path = if filetype == FILETYPE_DIRECTORY {
             self.realpath_internal(Some(pid), path)?
         } else {
             path.to_owned()
         };
-        if flags & O_CREAT != 0 && !existed {
-            let umask = self.processes.get_umask(pid)?;
-            self.apply_process_creation_metadata(pid, path, mode.unwrap_or(0o666), umask, false)?;
+        if let Some((requested_mode, umask, _)) = creation_metadata {
+            self.apply_process_creation_metadata_with_stat(
+                pid,
+                path,
+                requested_mode,
+                umask,
+                false,
+                Some(&opened_stat),
+                creation_parent.as_ref().map(|(_, stat)| stat),
+            )?;
         } else if flags & O_TRUNC != 0 {
             self.clear_setid_after_write(pid, path)?;
         }
-        self.resources
-            .check_fd_allocation(&self.resource_snapshot(), 1)?;
         let mut tables = lock_or_recover(&self.fd_tables);
+        self.resources
+            .check_fd_allocation_count(tables.total_open_fds(), 1)?;
         let table = tables
             .get_mut(pid)
             .ok_or_else(|| KernelError::no_such_process(pid))?;
-        Ok(table.open_with_details(&description_path, flags, filetype, lock_target)?)
+        let fd = table.open_with_details(&description_path, flags, filetype, lock_target)?;
+        Ok(fd)
     }
 
     pub fn fd_open_tmpfile(
@@ -6284,26 +6428,25 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         path: &str,
         flags: u32,
         mode: Option<u32>,
-    ) -> KernelResult<(u8, Option<FileLockTarget>)> {
+        existing_stat: Option<&VirtualStat>,
+    ) -> KernelResult<(VirtualStat, u8, Option<FileLockTarget>)> {
         if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
-            self.check_write_file_limits(path, 0)?;
-            VirtualFileSystem::create_file_exclusive_with_mode(
+            self.check_write_file_limits_with_existing(path, existing_stat, 0)?;
+            let stat = VirtualFileSystem::create_file_exclusive_with_mode_stat(
                 &mut self.filesystem,
                 path,
                 Vec::new(),
                 mode,
             )?;
             self.update_filesystem_usage_cache_for_inode_create(path, 0);
-            let stat = VirtualFileSystem::stat(&mut self.filesystem, path)?;
             return Ok((
+                stat.clone(),
                 filetype_for_path(path, &stat),
                 Some(FileLockTarget::new(stat.dev, stat.ino)),
             ));
         }
 
-        let exists = self.filesystem.exists(path)?;
-        if exists {
-            let existing_stat = VirtualFileSystem::stat(&mut self.filesystem, path)?;
+        let stat = if let Some(existing_stat) = existing_stat {
             if existing_stat.mode & 0o170000 == 0o140000 {
                 return Err(KernelError::new(
                     "ENXIO",
@@ -6311,25 +6454,102 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 ));
             }
             if flags & O_TRUNC != 0 {
-                let existing_size = self.current_storage_file_size(path)?;
+                let existing_size = existing_stat.size;
                 self.check_path_resize_limits_with_existing(existing_size, 0)?;
                 VirtualFileSystem::truncate(&mut self.filesystem, path, 0)?;
                 self.update_filesystem_usage_cache_for_resize(path, existing_size, 0);
             }
+            existing_stat.clone()
         } else if flags & O_CREAT != 0 {
-            self.check_write_file_limits(path, 0)?;
-            VirtualFileSystem::write_file_with_mode(&mut self.filesystem, path, Vec::new(), mode)?;
+            self.check_write_file_limits_with_existing(path, None, 0)?;
+            let stat = VirtualFileSystem::create_file_exclusive_with_mode_stat(
+                &mut self.filesystem,
+                path,
+                Vec::new(),
+                mode,
+            )?;
             self.update_filesystem_usage_cache_for_inode_create(path, 0);
+            stat
         } else {
             let _ = VirtualFileSystem::stat(&mut self.filesystem, path)?;
             unreachable!("stat should return an error when opening a missing path");
-        }
+        };
 
-        let stat = VirtualFileSystem::stat(&mut self.filesystem, path)?;
         Ok((
+            stat.clone(),
             filetype_for_path(path, &stat),
             Some(FileLockTarget::new(stat.dev, stat.ino)),
         ))
+    }
+
+    /// Create a file without a preceding target stat when an exact upper-layer
+    /// parent proves that pathname lookup cannot be redirected through a
+    /// symlink. Exclusive creation remains the atomic existence check: an
+    /// existing upper or lower entry returns `None` and takes the full open
+    /// path, while a genuinely missing leaf avoids a redundant merged lookup.
+    fn try_fd_open_create_missing(
+        &mut self,
+        pid: u32,
+        path: &str,
+        flags: u32,
+        mode: Option<u32>,
+    ) -> KernelResult<Option<u32>> {
+        if !self.exact_parent_proves_unprotected_leaf_lookup(path) {
+            return Ok(None);
+        }
+
+        // Parent-DAC or quota errors cannot be returned before we know whether
+        // the target already exists: opening an existing file does not require
+        // parent write permission or a free inode. The normal path repeats the
+        // failed check after determining target existence and propagates it
+        // only when creation is actually required.
+        let creation_parent =
+            match self.check_dac_parent_access_with_stat(pid, path, DAC_WRITE | DAC_EXECUTE) {
+                Ok(parent) => parent,
+                Err(_) => return Ok(None),
+            };
+        if self
+            .check_write_file_limits_with_existing(path, None, 0)
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        let requested_mode = mode.unwrap_or(0o666);
+        let umask = self.processes.get_umask(pid)?;
+        let initial_mode =
+            (requested_mode & !0o777) | ((requested_mode & 0o777) & !(umask & 0o777));
+        let stat = match VirtualFileSystem::create_file_exclusive_with_mode_stat(
+            &mut self.filesystem,
+            path,
+            Vec::new(),
+            Some(initial_mode),
+        ) {
+            Ok(stat) => stat,
+            Err(error) if error.code() == "EEXIST" => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        self.update_filesystem_usage_cache_for_inode_create(path, 0);
+        self.apply_process_creation_metadata_with_stat(
+            pid,
+            path,
+            requested_mode,
+            umask,
+            false,
+            Some(&stat),
+            Some(&creation_parent.1),
+        )?;
+
+        let filetype = filetype_for_path(path, &stat);
+        let lock_target = Some(FileLockTarget::new(stat.dev, stat.ino));
+        let mut tables = lock_or_recover(&self.fd_tables);
+        self.resources
+            .check_fd_allocation_count(tables.total_open_fds(), 1)?;
+        let table = tables
+            .get_mut(pid)
+            .ok_or_else(|| KernelError::no_such_process(pid))?;
+        let fd = table.open_with_details(path, flags, filetype, lock_target)?;
+        Ok(Some(fd))
     }
 
     fn validate_fd_open_flags(&mut self, pid: u32, path: &str, flags: u32) -> KernelResult<()> {
@@ -6432,7 +6652,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     fn reject_read_only_resolved_write_path(&mut self, path: &str) -> KernelResult<()> {
         self.reject_read_only_write_path(path)?;
 
-        if let Some(resolved) = self.resolve_write_guard_path(path, true)? {
+        let normalized = normalize_path(path);
+        if self.exact_write_guard_proves_unprotected(&normalized, true) {
+            return Ok(());
+        }
+        let resolved = self.resolve_write_guard_path(&normalized, true)?;
+        if let Some(resolved) = resolved.as_deref() {
             if is_agentos_path(&resolved) {
                 return Err(read_only_filesystem_error(&resolved));
             }
@@ -6440,7 +6665,9 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 return Err(read_only_filesystem_error(&resolved));
             }
         }
-        if self.has_agentos_hardlink_alias(path)? {
+        if resolved.as_deref() != Some(normalized.as_str())
+            && self.has_agentos_hardlink_alias(&normalized)?
+        {
             return Err(read_only_filesystem_error(path));
         }
 
@@ -6450,7 +6677,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     fn reject_read_only_entry_write_path(&mut self, path: &str) -> KernelResult<()> {
         self.reject_read_only_write_path(path)?;
 
-        if let Some(resolved) = self.resolve_write_guard_path(path, false)? {
+        let normalized = normalize_path(path);
+        if self.exact_write_guard_proves_unprotected(&normalized, false) {
+            return Ok(());
+        }
+        let resolved = self.resolve_write_guard_path(&normalized, false)?;
+        if let Some(resolved) = resolved.as_deref() {
             if is_agentos_path(&resolved) {
                 return Err(read_only_filesystem_error(&resolved));
             }
@@ -6458,18 +6690,55 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 return Err(read_only_filesystem_error(&resolved));
             }
         }
-        if self.has_agentos_hardlink_alias(path)? {
+        if resolved.as_deref() != Some(normalized.as_str())
+            && self.has_agentos_hardlink_alias(&normalized)?
+        {
             return Err(read_only_filesystem_error(path));
         }
 
         Ok(())
     }
 
+    fn exact_write_guard_proves_unprotected(
+        &mut self,
+        normalized_path: &str,
+        follow_final_symlink: bool,
+    ) -> bool {
+        let Some(stat) = self.raw_filesystem_mut().lstat_exact(normalized_path) else {
+            return false;
+        };
+        if follow_final_symlink && stat.is_symbolic_link {
+            return false;
+        }
+
+        // Exact lookup proves that no parent component is a symlink. Directory
+        // hard links are not supported, and entry operations on a symlink do
+        // not mutate its target. A multiply-linked regular inode still needs
+        // the protected-subtree alias scan below.
+        stat.is_directory || stat.is_symbolic_link || stat.nlink <= 1
+    }
+
+    /// An exact ordinary parent proves that no ancestor symlink can redirect a
+    /// leaf lookup into the protected agentOS tree. This does not assert that
+    /// the leaf is absent; the atomic exclusive create determines that. Exact
+    /// lookups are intentionally upper-layer only, so any uncertainty (lower
+    /// parent, symlink, non-directory) falls back to full resolution.
+    fn exact_parent_proves_unprotected_leaf_lookup(&mut self, path: &str) -> bool {
+        let normalized = normalize_path(path);
+        let parent = parent_path(&normalized);
+        if is_agentos_path(&normalized) || is_agentos_path(&parent) {
+            return false;
+        }
+        self.raw_filesystem_mut()
+            .stat_exact(&parent)
+            .is_some_and(|stat| stat.is_directory && !stat.is_symbolic_link)
+    }
+
     fn has_agentos_hardlink_alias(&mut self, path: &str) -> KernelResult<bool> {
         let Some(target) = self.storage_lstat(path)? else {
             return Ok(false);
         };
-        if target.is_directory || target.is_symbolic_link {
+        if target.is_directory || target.is_symbolic_link || target.nlink <= 1 {
             return Ok(false);
         }
 
@@ -6516,42 +6785,38 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             return Ok(Some(normalized));
         }
 
-        if follow_final_symlink {
-            if let Ok(resolved) = self.filesystem.realpath(&normalized) {
-                return Ok(Some(resolved));
-            }
+        let mut unresolved = Vec::new();
+        let mut candidate = normalized.clone();
+        if !follow_final_symlink {
+            let leaf = candidate
+                .rsplit('/')
+                .next()
+                .filter(|leaf| !leaf.is_empty())
+                .expect("normalized non-root path has a leaf");
+            unresolved.push(leaf.to_string());
+            candidate = parent_path(&candidate);
         }
 
-        let components: Vec<&str> = normalized
-            .split('/')
-            .filter(|component| !component.is_empty())
-            .collect();
-        let mut resolved_prefix = String::from("/");
-        let mut raw_prefix = String::from("/");
-
-        for (index, component) in components.iter().enumerate() {
-            let is_final = index + 1 == components.len();
-            if is_final && !follow_final_symlink {
-                return Ok(Some(join_absolute_path(&resolved_prefix, component)));
-            }
-
-            raw_prefix = join_absolute_path(&raw_prefix, component);
-            match self.filesystem.realpath(&raw_prefix) {
-                Ok(resolved) => {
-                    resolved_prefix = resolved;
-                }
-                Err(error) if error.code() == "ENOENT" => {
-                    let mut resolved = resolved_prefix;
-                    for remaining in &components[index..] {
-                        resolved = join_absolute_path(&resolved, remaining);
+        loop {
+            match self.filesystem.realpath(&candidate) {
+                Ok(mut resolved) => {
+                    for component in unresolved.iter().rev() {
+                        resolved = join_absolute_path(&resolved, component);
                     }
                     return Ok(Some(resolved));
+                }
+                Err(error) if error.code() == "ENOENT" && candidate != "/" => {
+                    let leaf = candidate
+                        .rsplit('/')
+                        .next()
+                        .filter(|leaf| !leaf.is_empty())
+                        .expect("normalized non-root path has a leaf");
+                    unresolved.push(leaf.to_string());
+                    candidate = parent_path(&candidate);
                 }
                 Err(error) => return Err(error.into()),
             }
         }
-
-        Ok(Some(resolved_prefix))
     }
 
     fn populate_poll_target_revents(
@@ -7108,6 +7373,35 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
 
     fn raw_filesystem_mut(&mut self) -> &mut F {
         self.filesystem.inner_mut().inner_mut()
+    }
+
+    /// Return live exact-backend metadata for an unrestricted ordinary path.
+    /// Exact lookup proves there is no symlink ancestor, so bypassing the
+    /// permission/device wrappers cannot change pathname resolution. Policy
+    /// validation still runs before returning metadata; virtual `/proc` and
+    /// `/dev` entries retain their synthesized kernel semantics.
+    fn exact_unrestricted_storage_stat(
+        &mut self,
+        path: &str,
+        follow_final_symlink: bool,
+    ) -> KernelResult<Option<VirtualStat>> {
+        if !self.filesystem.filesystem_unrestricted()
+            || is_proc_path(path)
+            || is_virtual_device_storage_path(path)
+        {
+            return Ok(None);
+        }
+        let stat = if follow_final_symlink {
+            self.raw_filesystem_mut().stat_exact(path)
+        } else {
+            self.raw_filesystem_mut().lstat_exact(path)
+        };
+        if stat.is_some() {
+            self.filesystem
+                .check_virtual_path(FsOperation::Stat, path)
+                .map_err(KernelError::from)?;
+        }
+        Ok(stat)
     }
 
     fn read_file_internal(
@@ -7981,6 +8275,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             .get(pid)
             .ok_or_else(|| KernelError::no_such_process(pid))?
             .identity;
+        // Linux root (CAP_DAC_OVERRIDE) bypasses directory search permission.
+        // Target checks still run in `check_dac_access`, including Linux's
+        // requirement that a non-directory have at least one execute bit.
+        if identity.euid == 0 {
+            return Ok(());
+        }
         let normalized = normalize_path(path);
         let components = normalized
             .split('/')
@@ -8016,6 +8316,28 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             .identity;
         let stat = self.filesystem.stat(path)?;
         self.check_dac_mode_with_acl(&identity, &stat, access, path)
+    }
+
+    fn check_dac_access_with_stat(
+        &mut self,
+        pid: u32,
+        path: &str,
+        access: u32,
+        stat: &VirtualStat,
+    ) -> KernelResult<()> {
+        if is_proc_path(path) {
+            return Ok(());
+        }
+        self.check_dac_traversal(pid, path)?;
+        if access == 0 {
+            return Ok(());
+        }
+        let identity = self
+            .processes
+            .get(pid)
+            .ok_or_else(|| KernelError::no_such_process(pid))?
+            .identity;
+        self.check_dac_mode_with_acl(&identity, stat, access, path)
     }
 
     fn check_dac_mode_with_acl(
@@ -8081,13 +8403,38 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     }
 
     fn check_dac_parent_access(&mut self, pid: u32, path: &str, access: u32) -> KernelResult<()> {
+        self.check_dac_parent_access_with_stat(pid, path, access)
+            .map(|_| ())
+    }
+
+    fn check_dac_parent_access_with_stat(
+        &mut self,
+        pid: u32,
+        path: &str,
+        access: u32,
+    ) -> KernelResult<(String, VirtualStat)> {
         let mut parent = parent_path(path);
         loop {
-            match self.check_dac_access(pid, &parent, access) {
+            let result = self.check_dac_traversal(pid, &parent).and_then(|()| {
+                let stat = self
+                    .raw_filesystem_mut()
+                    .stat_exact(&parent)
+                    .map(Ok)
+                    .unwrap_or_else(|| self.filesystem.stat(&parent))?;
+                let identity = self
+                    .processes
+                    .get(pid)
+                    .ok_or_else(|| KernelError::no_such_process(pid))?
+                    .identity;
+                self.check_dac_mode_with_acl(&identity, &stat, access, &parent)?;
+                Ok(stat)
+            });
+            match result {
                 Err(error) if error.code() == "ENOENT" && parent != "/" => {
                     parent = parent_path(&parent);
                 }
-                result => return result,
+                Ok(stat) => return Ok((parent, stat)),
+                Err(error) => return Err(error),
             }
         }
     }
@@ -8124,33 +8471,59 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         umask: u32,
         is_directory: bool,
     ) -> KernelResult<()> {
+        self.apply_process_creation_metadata_with_stat(
+            pid,
+            path,
+            mode,
+            umask,
+            is_directory,
+            None,
+            None,
+        )
+    }
+
+    fn apply_process_creation_metadata_with_stat(
+        &mut self,
+        pid: u32,
+        path: &str,
+        mode: u32,
+        umask: u32,
+        is_directory: bool,
+        created_stat: Option<&VirtualStat>,
+        parent_stat: Option<&VirtualStat>,
+    ) -> KernelResult<()> {
         let identity = self
             .processes
             .get(pid)
             .ok_or_else(|| KernelError::no_such_process(pid))?
             .identity;
         let parent_path = parent_path(path);
-        let parent = self.filesystem.stat(&parent_path).map_err(|error| {
-            KernelError::new(
-                error.code(),
-                format!("creation parent stat for '{parent_path}' failed: {error}"),
-            )
-        })?;
+        let parent = match parent_stat {
+            Some(parent) => parent.clone(),
+            None => self.filesystem.stat(&parent_path).map_err(|error| {
+                KernelError::new(
+                    error.code(),
+                    format!("creation parent stat for '{parent_path}' failed: {error}"),
+                )
+            })?,
+        };
         let inherit_setgid = parent.mode & 0o2000 != 0;
         let gid = if inherit_setgid {
             parent.gid
         } else {
             identity.egid
         };
-        self.filesystem
-            .chown(path, identity.euid, gid)
-            .map_err(|error| {
-                KernelError::new(
-                    error.code(),
-                    format!("creation ownership for '{path}' failed: {error}"),
-                )
-            })?;
-        let inherited_acl = self.read_posix_acl(&parent_path, POSIX_ACL_DEFAULT)?;
+        if created_stat.is_none_or(|stat| stat.uid != identity.euid || stat.gid != gid) {
+            self.filesystem
+                .chown(path, identity.euid, gid)
+                .map_err(|error| {
+                    KernelError::new(
+                        error.code(),
+                        format!("creation ownership for '{path}' failed: {error}"),
+                    )
+                })?;
+        }
+        let inherited_acl = self.read_default_posix_acl_cached(&parent_path, &parent)?;
         let mut masked_mode = if let Some(acl) = inherited_acl.as_ref() {
             acl.restrict_to_mode(mode).mode(mode)
         } else {
@@ -8159,12 +8532,14 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         if is_directory && inherit_setgid {
             masked_mode |= 0o2000;
         }
-        self.filesystem.chmod(path, masked_mode).map_err(|error| {
-            KernelError::new(
-                error.code(),
-                format!("creation mode for '{path}' failed: {error}"),
-            )
-        })?;
+        if created_stat.is_none_or(|stat| stat.mode & 0o7777 != masked_mode & 0o7777) {
+            self.filesystem.chmod(path, masked_mode).map_err(|error| {
+                KernelError::new(
+                    error.code(),
+                    format!("creation mode for '{path}' failed: {error}"),
+                )
+            })?;
+        }
         if let Some(default_acl) = inherited_acl {
             let access_acl = default_acl.restrict_to_mode(mode);
             self.filesystem
@@ -8180,6 +8555,35 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             }
         }
         Ok(())
+    }
+
+    fn read_default_posix_acl_cached(
+        &mut self,
+        path: &str,
+        stat: &VirtualStat,
+    ) -> KernelResult<Option<PosixAcl>> {
+        let cache_key = (
+            stat.dev,
+            stat.ino,
+            stat.ctime_ms,
+            stat.ctime_nsec,
+            stat.mode,
+            stat.uid,
+            stat.gid,
+        );
+        if self.no_default_posix_acl_cache.contains(&cache_key) {
+            return Ok(None);
+        }
+        match self.read_posix_acl(path, POSIX_ACL_DEFAULT)? {
+            Some(acl) => Ok(Some(acl)),
+            None => {
+                if self.no_default_posix_acl_cache.len() >= 4_096 {
+                    self.no_default_posix_acl_cache.clear();
+                }
+                self.no_default_posix_acl_cache.insert(cache_key);
+                Ok(None)
+            }
+        }
     }
 
     fn clear_setid_after_write(&mut self, pid: u32, path: &str) -> KernelResult<()> {
@@ -8300,7 +8704,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         Ok(())
     }
 
-    fn check_mkdir_limits(&mut self, path: &str, recursive: bool) -> KernelResult<()> {
+    fn check_mkdir_limits(
+        &mut self,
+        path: &str,
+        recursive: bool,
+        new_inodes: usize,
+    ) -> KernelResult<()> {
         if is_virtual_device_storage_path(path) {
             return Ok(());
         }
@@ -8310,7 +8719,6 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         }
 
         let usage = self.filesystem_usage()?;
-        let new_inodes = count_missing_directory_components(self.raw_filesystem_mut(), path, true)?;
         self.resources.check_filesystem_usage(
             &usage,
             usage.total_bytes,
@@ -9060,50 +9468,6 @@ fn parse_dev_fd_path(path: &str) -> KernelResult<Option<u32>> {
     Ok(Some(fd))
 }
 
-fn count_missing_directory_components<F: VirtualFileSystem>(
-    filesystem: &mut F,
-    path: &str,
-    include_final: bool,
-) -> VfsResult<usize> {
-    let normalized = normalize_path(path);
-    let parts = normalized
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    let limit = if include_final {
-        parts.len()
-    } else {
-        parts.len().saturating_sub(1)
-    };
-
-    let mut current = String::from("/");
-    for (index, part) in parts.iter().take(limit).enumerate() {
-        let candidate = if current == "/" {
-            format!("/{}", part)
-        } else {
-            format!("{current}/{}", part)
-        };
-
-        match filesystem.stat(&candidate) {
-            Ok(stat) => {
-                if !stat.is_directory {
-                    return Err(VfsError::new(
-                        "ENOTDIR",
-                        format!("not a directory, mkdir '{candidate}'"),
-                    ));
-                }
-                current = candidate;
-            }
-            Err(error) if error.code() == "ENOENT" => {
-                return Ok(limit.saturating_sub(index));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    Ok(0)
-}
-
 fn parent_path(path: &str) -> String {
     let normalized = normalize_path(path);
     let Some((head, _)) = normalized.rsplit_once('/') else {
@@ -9731,13 +10095,19 @@ mod tests {
     use super::*;
     use crate::fd_table::{FD_CLOEXEC, F_GETFD, F_SETFD, O_RDONLY};
     use crate::process_table::SIGTERM;
-    use crate::vfs::MemoryFileSystem;
+    use crate::vfs::{MemoryFileSystem, S_IFCHR};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::thread;
 
     fn kernel_with_process() -> (KernelVm<MemoryFileSystem>, KernelProcessHandle) {
         let mut config = KernelVmConfig::new("vm-fd-socket-test");
         config.permissions = Permissions::allow_all();
+        kernel_with_process_config(config)
+    }
+
+    fn kernel_with_process_config(
+        config: KernelVmConfig,
+    ) -> (KernelVm<MemoryFileSystem>, KernelProcessHandle) {
         let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
         kernel
             .register_driver(CommandDriver::new("wasm", ["socket-test"]))
@@ -9753,6 +10123,127 @@ mod tests {
             )
             .expect("spawn socket test process");
         (kernel, process)
+    }
+
+    #[test]
+    fn create_open_of_existing_file_does_not_require_parent_write_access() {
+        let (mut kernel, process) = kernel_with_process();
+        let pid = process.pid();
+        kernel.create_dir("/locked").unwrap();
+        kernel
+            .write_file("/locked/existing", b"contents".to_vec())
+            .unwrap();
+        kernel.chmod("/locked", 0o555).unwrap();
+        kernel.chmod("/locked/existing", 0o666).unwrap();
+
+        let fd = kernel
+            .fd_open(
+                "wasm",
+                pid,
+                "/locked/existing",
+                O_CREAT | O_RDWR,
+                Some(0o666),
+            )
+            .expect("O_CREAT must open an existing writable file without parent write access");
+        kernel.fd_close("wasm", pid, fd).unwrap();
+
+        let error = kernel
+            .fd_open(
+                "wasm",
+                pid,
+                "/locked/missing",
+                O_CREAT | O_RDWR,
+                Some(0o666),
+            )
+            .expect_err("creating a missing file still requires parent write access");
+        assert_eq!(error.code(), "EACCES");
+    }
+
+    #[test]
+    fn create_open_of_existing_file_succeeds_at_inode_limit() {
+        let mut config = KernelVmConfig::new("vm-create-open-inode-limit");
+        config.permissions = Permissions::allow_all();
+        const INODE_LIMIT: usize = 16;
+        config.resources.max_inode_count = Some(INODE_LIMIT);
+        let (mut kernel, process) = kernel_with_process_config(config);
+        let pid = process.pid();
+        kernel
+            .write_file("/existing", b"contents".to_vec())
+            .expect("seed existing file");
+        for index in 0..INODE_LIMIT {
+            if kernel.filesystem_usage().unwrap().inode_count == INODE_LIMIT {
+                break;
+            }
+            kernel
+                .write_file(&format!("/filler-{index}"), Vec::new())
+                .expect("fill remaining inode capacity");
+        }
+        assert_eq!(
+            kernel.filesystem_usage().unwrap().inode_count,
+            INODE_LIMIT,
+            "test setup must reach the configured inode limit"
+        );
+
+        let fd = kernel
+            .fd_open("wasm", pid, "/existing", O_CREAT | O_RDWR, Some(0o666))
+            .expect("O_CREAT must open an existing file at the inode limit");
+        kernel.fd_close("wasm", pid, fd).unwrap();
+
+        let error = kernel
+            .fd_open("wasm", pid, "/missing", O_CREAT | O_RDWR, Some(0o666))
+            .expect_err("creating a missing file must enforce the inode limit");
+        assert_eq!(error.code(), "ENOSPC");
+    }
+
+    #[test]
+    fn unrestricted_exact_stat_keeps_live_symlink_and_device_semantics() {
+        let (mut kernel, process) = kernel_with_process();
+        let pid = process.pid();
+        kernel.create_dir("/real").unwrap();
+        kernel.write_file("/real/file", b"one".to_vec()).unwrap();
+        assert_eq!(
+            kernel
+                .stat_for_process("wasm", pid, "/real/file")
+                .unwrap()
+                .size,
+            3
+        );
+        kernel
+            .write_file("/real/file", b"updated".to_vec())
+            .unwrap();
+        assert_eq!(
+            kernel
+                .stat_for_process("wasm", pid, "/real/file")
+                .unwrap()
+                .size,
+            7,
+            "the exact lookup must read live metadata rather than a cache"
+        );
+
+        kernel.symlink("/real", "/alias").unwrap();
+        assert!(
+            kernel
+                .lstat_for_process("wasm", pid, "/alias")
+                .unwrap()
+                .is_symbolic_link
+        );
+        assert_eq!(
+            kernel
+                .stat_for_process("wasm", pid, "/alias/file")
+                .unwrap()
+                .size,
+            7,
+            "a symlink ancestor must fall back to full path resolution"
+        );
+        assert_eq!(
+            kernel
+                .stat_for_process("wasm", pid, "/dev/null")
+                .unwrap()
+                .mode
+                & 0o170000,
+            S_IFCHR,
+            "synthetic device metadata must bypass the storage exact path"
+        );
     }
 
     #[test]
@@ -10794,7 +11285,10 @@ mod tests {
 
         let hook_state = Arc::new((Mutex::new((false, false)), Condvar::new()));
         let hook_state_for_cleanup = Arc::clone(&hook_state);
-        set_cleanup_process_resources_test_hook(Some(Arc::new(move || {
+        set_cleanup_process_resources_test_hook(Some(Arc::new(move |pid| {
+            if pid != 41 {
+                return;
+            }
             let (state, wake) = &*hook_state_for_cleanup;
             let mut state = lock_or_recover(state);
             state.0 = true;

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -336,6 +336,15 @@ pub trait VirtualFileSystem {
         let _ = mode;
         self.create_file_exclusive(path, content)
     }
+    fn create_file_exclusive_with_mode_stat(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        self.create_file_exclusive_with_mode(path, content, mode)?;
+        self.stat(path)
+    }
     /// Appends caller-owned bytes into the filesystem after checking that the
     /// in-memory file can grow without overflowing addressable memory.
     fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
@@ -450,6 +459,16 @@ pub trait VirtualFileSystem {
     fn symlink(&mut self, target: &str, link_path: &str) -> VfsResult<()>;
     fn read_link(&self, path: &str) -> VfsResult<String>;
     fn lstat(&self, path: &str) -> VfsResult<VirtualStat>;
+    /// Returns metadata only when `path` is an exact backend entry with no
+    /// symlink ancestor. Composing mount tables use this optional proof to skip
+    /// a redundant cross-mount realpath walk.
+    fn lstat_exact(&self, path: &str) -> Option<VirtualStat> {
+        let _ = path;
+        None
+    }
+    fn stat_exact(&self, path: &str) -> Option<VirtualStat> {
+        self.lstat_exact(path).filter(|stat| !stat.is_symbolic_link)
+    }
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()>;
     fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()>;
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()>;
@@ -783,8 +802,8 @@ pub struct MemoryFileSystemSnapshot {
 #[derive(Debug)]
 pub struct MemoryFileSystem {
     device_id: u64,
-    path_index: BTreeMap<String, u64>,
-    inodes: BTreeMap<u64, Inode>,
+    path_index: HashMap<String, u64>,
+    inodes: HashMap<u64, Inode>,
     next_ino: u64,
 }
 
@@ -792,8 +811,8 @@ impl MemoryFileSystem {
     pub fn new() -> Self {
         let mut filesystem = Self {
             device_id: allocate_memory_filesystem_device_id(),
-            path_index: BTreeMap::new(),
-            inodes: BTreeMap::new(),
+            path_index: HashMap::new(),
+            inodes: HashMap::new(),
             next_ino: 1,
         };
 
@@ -823,11 +842,10 @@ impl MemoryFileSystem {
         };
 
         let mut entries = BTreeMap::<String, String>::new();
-        for (candidate_path, _) in self.path_index.range(prefix.clone()..) {
+        for candidate_path in self.path_index.keys() {
             if !candidate_path.starts_with(&prefix) {
-                break;
+                continue;
             }
-
             let rest = &candidate_path[prefix.len()..];
             if rest.is_empty() || rest.contains('/') || !include(rest) {
                 continue;
@@ -845,6 +863,168 @@ impl MemoryFileSystem {
         }
 
         Ok(entries.into_values().collect())
+    }
+
+    /// Reads metadata for a path whose parent symlinks have already been
+    /// resolved by a composing filesystem.
+    pub(crate) fn lstat_resolved_path(&self, path: &str) -> VfsResult<VirtualStat> {
+        let ino = self
+            .path_index
+            .get(path)
+            .ok_or_else(|| VfsError::not_found("lstat", path))?;
+        let inode = self
+            .inodes
+            .get(ino)
+            .expect("path index should always point at a valid inode");
+        Ok(self.build_stat(inode))
+    }
+
+    /// Resolves a path entirely within this filesystem and returns metadata for
+    /// the resolved entry. Composing filesystems can use this as a fast path:
+    /// failure means that resolution may cross another layer and must fall back
+    /// to the full merged resolver.
+    pub(crate) fn resolve_existing_path(
+        &self,
+        path: &str,
+        follow_final_symlink: bool,
+    ) -> VfsResult<(String, VirtualStat)> {
+        let resolved = self.resolve_path_with_options(path, follow_final_symlink, 0)?;
+        let stat = self.lstat_resolved_path(&resolved)?;
+        Ok((resolved, stat))
+    }
+
+    /// Reads a symlink whose parent symlinks have already been resolved by a
+    /// composing filesystem.
+    pub(crate) fn read_link_resolved_path(&self, path: &str) -> VfsResult<String> {
+        let ino = self
+            .path_index
+            .get(path)
+            .ok_or_else(|| VfsError::not_found("readlink", path))?;
+        let inode = self
+            .inodes
+            .get(ino)
+            .expect("path index should always point at a valid inode");
+        match &inode.kind {
+            InodeKind::SymbolicLink { target } => Ok(target.clone()),
+            _ => Err(VfsError::invalid_input(format!(
+                "invalid argument, readlink '{path}'"
+            ))),
+        }
+    }
+
+    /// Writes a file after a composing filesystem has resolved the path and
+    /// materialized its parent directory.
+    pub(crate) fn write_file_resolved_path(
+        &mut self,
+        path: &str,
+        content: Vec<u8>,
+        mode: Option<u32>,
+    ) -> VfsResult<()> {
+        let parent = dirname(path);
+        let parent_ino = self
+            .path_index
+            .get(&parent)
+            .ok_or_else(|| VfsError::not_found("open", &parent))?;
+        let parent_inode = self
+            .inodes
+            .get(parent_ino)
+            .expect("path index should always point at a valid inode");
+        if !matches!(parent_inode.kind, InodeKind::Directory) {
+            return Err(VfsError::not_directory("open", &parent));
+        }
+
+        if let Some(ino) = self.path_index.get(path).copied() {
+            let inode = self
+                .inodes
+                .get_mut(&ino)
+                .expect("path index should always point at a valid inode");
+            let now = now_ms();
+            return match &mut inode.kind {
+                InodeKind::File { data } => {
+                    *data = content;
+                    inode.metadata.allocated_extents = dense_allocation(data.len() as u64);
+                    inode.metadata.unwritten_extents.clear();
+                    inode.metadata.mtime_ms = now;
+                    inode.metadata.ctime_ms = now;
+                    Ok(())
+                }
+                InodeKind::Directory => Err(VfsError::is_directory("open", path)),
+                InodeKind::SymbolicLink { .. } => Err(VfsError::not_found("open", path)),
+                InodeKind::CharacterDevice { .. }
+                | InodeKind::BlockDevice { .. }
+                | InodeKind::Fifo => Err(VfsError::new(
+                    "ENXIO",
+                    format!("device write requires kernel dispatch: {path}"),
+                )),
+            };
+        }
+
+        let mode = mode.map_or(S_IFREG | 0o644, |mode| S_IFREG | (mode & 0o7777));
+        let ino = self.allocate_inode(InodeKind::File { data: content }, mode);
+        self.path_index.insert(path.to_owned(), ino);
+        Ok(())
+    }
+
+    /// Creates and returns metadata for a file whose parent symlinks have
+    /// already been resolved by a composing filesystem.
+    pub(crate) fn create_file_exclusive_resolved_path(
+        &mut self,
+        path: &str,
+        content: Vec<u8>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        if self.path_index.contains_key(path) {
+            return Err(VfsError::already_exists("open", path));
+        }
+        let parent = dirname(path);
+        let parent_ino = self
+            .path_index
+            .get(&parent)
+            .ok_or_else(|| VfsError::not_found("open", &parent))?;
+        let parent_inode = self
+            .inodes
+            .get(parent_ino)
+            .expect("path index should always point at a valid inode");
+        if !matches!(parent_inode.kind, InodeKind::Directory) {
+            return Err(VfsError::not_directory("open", &parent));
+        }
+
+        let mode = mode.map_or(S_IFREG | 0o644, |mode| S_IFREG | (mode & 0o7777));
+        let ino = self.allocate_inode(InodeKind::File { data: content }, mode);
+        self.path_index.insert(path.to_owned(), ino);
+        let inode = self
+            .inodes
+            .get(&ino)
+            .expect("new path should point at its allocated inode");
+        Ok(self.build_stat(inode))
+    }
+
+    /// Creates a directory after a composing filesystem has resolved the path
+    /// and materialized its parent directory.
+    pub(crate) fn create_dir_resolved_path(
+        &mut self,
+        path: &str,
+        mode: Option<u32>,
+    ) -> VfsResult<()> {
+        if self.path_index.contains_key(path) {
+            return Err(VfsError::already_exists("mkdir", path));
+        }
+        let parent = dirname(path);
+        let parent_ino = self
+            .path_index
+            .get(&parent)
+            .ok_or_else(|| VfsError::not_found("mkdir", &parent))?;
+        let parent_inode = self
+            .inodes
+            .get(parent_ino)
+            .expect("path index should always point at a valid inode");
+        if !matches!(parent_inode.kind, InodeKind::Directory) {
+            return Err(VfsError::not_directory("mkdir", &parent));
+        }
+        let mode = mode.map_or(S_IFDIR | 0o755, |mode| S_IFDIR | (mode & 0o7777));
+        let ino = self.allocate_inode(InodeKind::Directory, mode);
+        self.path_index.insert(path.to_owned(), ino);
+        Ok(())
     }
 
     pub fn link_count_in_subtree(&self, ino: u64, path: &str) -> usize {
@@ -1187,7 +1367,11 @@ impl MemoryFileSystem {
     /// byte and inode limits before reaching this raw clone operation.
     pub fn snapshot(&self) -> MemoryFileSystemSnapshot {
         MemoryFileSystemSnapshot {
-            path_index: self.path_index.clone(),
+            path_index: self
+                .path_index
+                .iter()
+                .map(|(path, ino)| (path.clone(), *ino))
+                .collect(),
             inodes: self
                 .inodes
                 .iter()
@@ -1245,7 +1429,7 @@ impl MemoryFileSystem {
     pub fn from_snapshot(snapshot: MemoryFileSystemSnapshot) -> Self {
         Self {
             device_id: allocate_memory_filesystem_device_id(),
-            path_index: snapshot.path_index,
+            path_index: snapshot.path_index.into_iter().collect(),
             inodes: snapshot
                 .inodes
                 .into_iter()
@@ -1341,11 +1525,10 @@ impl VirtualFileSystem for MemoryFileSystem {
         };
 
         let mut entries = BTreeMap::<String, VirtualDirEntry>::new();
-        for (candidate_path, ino) in self.path_index.range(prefix.clone()..) {
+        for (candidate_path, ino) in &self.path_index {
             if !candidate_path.starts_with(&prefix) {
-                break;
+                continue;
             }
-
             let rest = &candidate_path[prefix.len()..];
             if rest.is_empty() || rest.contains('/') {
                 continue;
@@ -1418,6 +1601,17 @@ impl VirtualFileSystem for MemoryFileSystem {
         );
         self.path_index.insert(normalized, ino);
         Ok(())
+    }
+
+    fn create_file_exclusive_with_mode_stat(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        let normalized = self.resolve_path(path, 0)?;
+        self.mkdir(&dirname(&normalized), true)?;
+        self.create_file_exclusive_resolved_path(&normalized, content.into(), mode)
     }
 
     fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
@@ -1707,6 +1901,10 @@ impl VirtualFileSystem for MemoryFileSystem {
     fn lstat(&self, path: &str) -> VfsResult<VirtualStat> {
         let inode = self.inode_for_existing_path(path, "lstat", false)?;
         Ok(self.build_stat(inode))
+    }
+
+    fn lstat_exact(&self, path: &str) -> Option<VirtualStat> {
+        self.lstat_resolved_path(&normalize_path(path)).ok()
     }
 
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
@@ -2234,6 +2432,15 @@ pub fn normalize_path(path: &str) -> String {
     if path.is_empty() {
         return String::from("/");
     }
+    if path.starts_with('/')
+        && (path == "/"
+            || (!path.ends_with('/')
+                && path[1..].split('/').all(|component| {
+                    !component.is_empty() && component != "." && component != ".."
+                })))
+    {
+        return path.to_owned();
+    }
 
     let candidate = if path.starts_with('/') {
         path.to_owned()
@@ -2519,5 +2726,57 @@ fn now_time_spec() -> VirtualTimeSpec {
     VirtualTimeSpec {
         sec: now.as_secs() as i64,
         nsec: now.subsec_nanos(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_path, MemoryFileSystem, VirtualFileSystem};
+
+    #[test]
+    fn normalize_path_fast_path_matches_canonicalization_edges() {
+        for (input, expected) in [
+            ("/", "/"),
+            (
+                "/workspace/node_modules/hono",
+                "/workspace/node_modules/hono",
+            ),
+            (
+                "workspace/node_modules/hono",
+                "/workspace/node_modules/hono",
+            ),
+            ("/workspace//hono", "/workspace/hono"),
+            ("/workspace/./hono/", "/workspace/hono"),
+            ("/workspace/pkg/../hono", "/workspace/hono"),
+            ("../../workspace", "/workspace"),
+            ("", "/"),
+        ] {
+            assert_eq!(normalize_path(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn hash_index_keeps_directory_and_snapshot_order_deterministic() {
+        let mut filesystem = MemoryFileSystem::new();
+        filesystem.mkdir("/zeta", false).unwrap();
+        filesystem.mkdir("/alpha", false).unwrap();
+        filesystem.mkdir("/middle", false).unwrap();
+
+        assert_eq!(
+            filesystem.read_dir("/").unwrap(),
+            ["alpha", "middle", "zeta"]
+        );
+
+        let snapshot = filesystem.snapshot();
+        assert_eq!(
+            snapshot
+                .path_index
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["/", "/alpha", "/middle", "/zeta"]
+        );
+        let mut restored = MemoryFileSystem::from_snapshot(snapshot);
+        assert_eq!(restored.read_dir("/").unwrap(), ["alpha", "middle", "zeta"]);
     }
 }

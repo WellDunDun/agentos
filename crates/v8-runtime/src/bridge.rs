@@ -1725,12 +1725,93 @@ fn vm_run_in_this_context_value<'s>(
     )
 }
 
+fn guest_loaded_module_value<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    loaded: crate::execution::GuestLoadedModule,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let object = v8::Object::new(scope);
+    let format_key = v8::String::new(scope, "format")?;
+    let format = v8::String::new(scope, &loaded.format)?;
+    object.set(scope, format_key.into(), format.into());
+    let source_key = v8::String::new(scope, "source")?;
+    let source = match loaded.source {
+        Some(source) => v8::String::new(scope, &source)?.into(),
+        None => v8::null(scope).into(),
+    };
+    object.set(scope, source_key.into(), source);
+    Some(object.into())
+}
+
+fn guest_resolved_module_value<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    resolved: crate::execution::GuestResolvedModule,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let object = v8::Object::new(scope);
+    let resolved_key = v8::String::new(scope, "resolved")?;
+    let resolved_path = v8::String::new(scope, &resolved.resolved)?;
+    object.set(scope, resolved_key.into(), resolved_path.into());
+
+    let loaded = guest_loaded_module_value(scope, resolved.loaded)?;
+    let loaded = v8::Local::<v8::Object>::try_from(loaded).ok()?;
+    for property in ["format", "source"] {
+        let key = v8::String::new(scope, property)?;
+        let value = loaded.get(scope, key.into())?;
+        object.set(scope, key.into(), value);
+    }
+    Some(object.into())
+}
+
+fn direct_guest_module_bridge_call<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    method: &str,
+    args: &mut v8::FunctionCallbackArguments<'s>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    match method {
+        "_resolveModule" | "_resolveModuleSync" => {
+            let specifier = args.get(0).to_rust_string_lossy(scope);
+            let referrer = args.get(1).to_rust_string_lossy(scope);
+            let mode = match args.get(2).to_rust_string_lossy(scope).as_str() {
+                "require" => crate::execution::GuestModuleResolveMode::Require,
+                _ => crate::execution::GuestModuleResolveMode::Import,
+            };
+            let include_module = args.get(3).boolean_value(scope);
+            let resolved =
+                crate::execution::resolve_loaded_guest_module(&specifier, &referrer, mode)?;
+            if !include_module {
+                return v8::String::new(scope, &resolved.resolved).map(Into::into);
+            }
+            guest_resolved_module_value(scope, resolved)
+        }
+        "_loadFile" | "_loadFileSync" => {
+            let path = args.get(0).to_rust_string_lossy(scope);
+            let loaded = crate::execution::load_guest_module(&path)?;
+            if args.get(1).boolean_value(scope) {
+                guest_loaded_module_value(scope, loaded)
+            } else {
+                loaded
+                    .source
+                    .and_then(|source| v8::String::new(scope, &source))
+                    .map(Into::into)
+            }
+        }
+        "_moduleFormat" => {
+            let path = args.get(0).to_rust_string_lossy(scope);
+            let loaded = crate::execution::load_guest_module(&path)?;
+            v8::String::new(scope, &loaded.format).map(Into::into)
+        }
+        _ => None,
+    }
+}
+
 fn handle_local_bridge_call<'s>(
     scope: &mut v8::HandleScope<'s>,
     method: &str,
     args: &mut v8::FunctionCallbackArguments<'s>,
     bridge_ctx: &BridgeCallContext,
 ) -> Result<Option<v8::Local<'s, v8::Value>>, String> {
+    if let Some(value) = direct_guest_module_bridge_call(scope, method, args) {
+        return Ok(Some(value));
+    }
     match method {
         "process.memoryUsage" => Ok(Some(process_memory_usage_value(scope))),
         "process.cpuUsage" => process_cpu_usage_value(scope, args).map(Some),

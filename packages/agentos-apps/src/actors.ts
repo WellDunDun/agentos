@@ -643,6 +643,7 @@ interface BuildPlan {
 	build: boolean;
 	staticRoot?: string;
 	dependencyCount: number;
+	hasDevDependencies: boolean;
 	hasLockfile: boolean;
 	usesRivetKit: boolean;
 }
@@ -726,6 +727,7 @@ function validateDeployment(
 			build: false,
 			staticRoot: ".",
 			dependencyCount: 0,
+			hasDevDependencies: false,
 			hasLockfile: false,
 			usesRivetKit: false,
 		};
@@ -761,6 +763,11 @@ function validateDeployment(
 			(count, dependencies) => count + Object.keys(dependencies).length,
 			0,
 		);
+	const hasDevDependencies =
+		typeof packageJson.devDependencies === "object" &&
+		packageJson.devDependencies !== null &&
+		!Array.isArray(packageJson.devDependencies) &&
+		Object.keys(packageJson.devDependencies).length > 0;
 	const usesRivetKit = [packageJson.dependencies, packageJson.devDependencies]
 		.filter(
 			(value): value is Record<string, unknown> =>
@@ -783,6 +790,7 @@ function validateDeployment(
 			entrypoint: normalizeAppPath(declaredEntrypoint),
 			build,
 			dependencyCount,
+			hasDevDependencies,
 			hasLockfile: Boolean(normalizedFiles["package-lock.json"]),
 			usesRivetKit,
 		};
@@ -798,6 +806,7 @@ function validateDeployment(
 				entrypoint: candidate,
 				build,
 				dependencyCount,
+				hasDevDependencies,
 				hasLockfile: Boolean(normalizedFiles["package-lock.json"]),
 				usesRivetKit,
 			};
@@ -809,6 +818,7 @@ function validateDeployment(
 			build: true,
 			staticRoot: "dist",
 			dependencyCount,
+			hasDevDependencies,
 			hasLockfile: Boolean(normalizedFiles["package-lock.json"]),
 			usesRivetKit,
 		};
@@ -819,6 +829,7 @@ function validateDeployment(
 			build: false,
 			staticRoot: ".",
 			dependencyCount,
+			hasDevDependencies,
 			hasLockfile: Boolean(normalizedFiles["package-lock.json"]),
 			usesRivetKit,
 		};
@@ -1173,28 +1184,33 @@ async function buildRelease(
 				logBuildPhase("application_built");
 			}
 
-			const prune = await build.execArgv(
-				"npm",
-				[
-					"prune",
-					"--omit=dev",
-					"--omit=optional",
-					"--omit=peer",
-					"--legacy-peer-deps",
-				],
-				{
-					cwd: "/workspace",
-					timeout: config.buildTimeoutMs,
-					captureStdio: true,
-				},
-			);
-			if (prune.exitCode !== 0) {
-				throwCommandFailure(
-					"install",
-					"npm prune --omit=dev --omit=optional",
-					prune,
-					config.maxBuildOutputBytes,
+			if (plan.hasDevDependencies) {
+				const prune = await build.execArgv(
+					"npm",
+					[
+						"prune",
+						"--omit=dev",
+						"--omit=optional",
+						"--omit=peer",
+						"--legacy-peer-deps",
+						"--no-audit",
+						"--no-fund",
+						"--loglevel=error",
+					],
+					{
+						cwd: "/workspace",
+						timeout: config.buildTimeoutMs,
+						captureStdio: true,
+					},
 				);
+				if (prune.exitCode !== 0) {
+					throwCommandFailure(
+						"install",
+						"npm prune --omit=dev --omit=optional",
+						prune,
+						config.maxBuildOutputBytes,
+					);
+				}
 			}
 
 			const nativeAddonCheck = await build.execArgv(

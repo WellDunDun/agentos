@@ -21,6 +21,8 @@ pub struct OverlayFileSystem {
     lowers: Vec<MemoryFileSystem>,
     upper: Option<MemoryFileSystem>,
     writes_locked: bool,
+    has_whiteouts: bool,
+    has_opaque_markers: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +70,8 @@ impl OverlayFileSystem {
             lowers: effective_lowers,
             upper,
             writes_locked: matches!(mode, OverlayMode::ReadOnly),
+            has_whiteouts: false,
+            has_opaque_markers: false,
         }
     }
 
@@ -77,10 +81,14 @@ impl OverlayFileSystem {
             effective_lowers.push(MemoryFileSystem::new());
         }
 
+        let has_whiteouts = upper.exists(OVERLAY_WHITEOUT_DIR);
+        let has_opaque_markers = upper.exists(OVERLAY_OPAQUE_DIR);
         Self {
             lowers: effective_lowers,
             upper: Some(upper),
             writes_locked: false,
+            has_whiteouts,
+            has_opaque_markers,
         }
     }
 
@@ -150,6 +158,50 @@ impl OverlayFileSystem {
             return Ok(normalized);
         }
 
+        // npm and other package managers rapidly build large trees in the
+        // writable layer. Once the complete path (including any followed
+        // symlinks) exists there, lower layers cannot affect its resolution.
+        // Let MemoryFileSystem resolve that case directly and retain the merged
+        // walk as the fallback for missing, mixed-layer, or lower-only paths.
+        if let Some(upper) = self.upper.as_ref() {
+            // MemoryFileSystem stores children at their resolved location and
+            // keeps subtree keys coherent across rename/removal. Therefore an
+            // exact non-symlink entry cannot sit beneath a symlink ancestor:
+            // the single index lookup is already a complete resolution. Keep
+            // final symlinks on the resolver below when callers follow them.
+            if let Ok(stat) = upper.lstat_resolved_path(&normalized) {
+                if (!follow_final_symlink || !stat.is_symbolic_link)
+                    && !self.is_whited_out(&normalized)
+                {
+                    return Ok(normalized);
+                }
+            }
+            // A missing leaf beneath a parent that resolves completely in the
+            // upper can be resolved from that parent without walking every
+            // component through the merged overlay again. The final merged
+            // lookup still observes lower entries and whiteouts; a final
+            // symlink falls through to the general resolver when requested.
+            let parent = Self::parent_path(&normalized);
+            if let Ok((resolved_parent, parent_stat)) = upper.resolve_existing_path(&parent, true) {
+                if parent_stat.is_directory && !parent_stat.is_symbolic_link {
+                    let resolved = Self::join_path(&resolved_parent, &Self::basename(&normalized));
+                    match self.merged_lstat_resolved(&resolved) {
+                        Ok(stat) if follow_final_symlink && stat.is_symbolic_link => {}
+                        Ok(_) => return Ok(resolved),
+                        Err(error) if error.code() == "ENOENT" => return Ok(resolved),
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            if let Ok((resolved, _)) =
+                upper.resolve_existing_path(&normalized, follow_final_symlink)
+            {
+                if !self.is_whited_out(&resolved) {
+                    return Ok(resolved);
+                }
+            }
+        }
+
         let components: Vec<&str> = normalized
             .split('/')
             .filter(|component| !component.is_empty())
@@ -162,9 +214,9 @@ impl OverlayFileSystem {
             let should_follow = !is_final || follow_final_symlink;
 
             if should_follow {
-                if let Ok(stat) = self.merged_lstat(&candidate) {
+                if let Ok(stat) = self.merged_lstat_resolved(&candidate) {
                     if stat.is_symbolic_link {
-                        let target = self.read_link_inner(&candidate)?;
+                        let target = self.read_link_resolved_inner(&candidate)?;
                         let target_path = if target.starts_with('/') {
                             Self::normalized(&target)
                         } else {
@@ -190,7 +242,7 @@ impl OverlayFileSystem {
                         return Err(Self::not_directory(&candidate));
                     }
                 }
-            } else if let Ok(stat) = self.merged_lstat(&candidate) {
+            } else if let Ok(stat) = self.merged_lstat_resolved(&candidate) {
                 if !is_final && !stat.is_directory {
                     return Err(Self::not_directory(&candidate));
                 }
@@ -314,11 +366,6 @@ impl OverlayFileSystem {
             return true;
         }
         if let Ok(resolved) = self.resolve_merged_path(path, true, 0) {
-            if Self::is_internal_metadata_path(&resolved) {
-                return true;
-            }
-        }
-        if let Ok(resolved) = self.resolved_destination_path(path) {
             if Self::is_internal_metadata_path(&resolved) {
                 return true;
             }
@@ -675,7 +722,17 @@ impl OverlayFileSystem {
     }
 
     fn marker_exists(&self, kind: OverlayMarkerKind, path: &str) -> bool {
+        if !self.has_markers(kind) {
+            return false;
+        }
         Self::marker_exists_in_upper(self.upper.as_ref(), kind, path)
+    }
+
+    fn has_markers(&self, kind: OverlayMarkerKind) -> bool {
+        match kind {
+            OverlayMarkerKind::Whiteout => self.has_whiteouts,
+            OverlayMarkerKind::Opaque => self.has_opaque_markers,
+        }
     }
 
     fn marker_exists_in_upper(
@@ -699,11 +756,18 @@ impl OverlayFileSystem {
     }
 
     fn set_marker(&mut self, kind: OverlayMarkerKind, path: &str, present: bool) -> VfsResult<()> {
+        if !present && !self.has_markers(kind) {
+            return Ok(());
+        }
         let marker_path = Self::marker_path(kind, path);
         if present {
             self.ensure_metadata_directories_in_upper(path)?;
             self.writable_upper(path)?
                 .write_file(&marker_path, Self::normalized(path).into_bytes())?;
+            match kind {
+                OverlayMarkerKind::Whiteout => self.has_whiteouts = true,
+                OverlayMarkerKind::Opaque => self.has_opaque_markers = true,
+            }
             return Ok(());
         }
 
@@ -816,6 +880,29 @@ impl OverlayFileSystem {
             .find_map(|(index, lower)| lower.lstat(path).ok().map(|stat| (index, stat)))
     }
 
+    fn find_lower_by_resolved_entry(&self, path: &str) -> Option<(usize, VirtualStat)> {
+        self.lowers.iter().enumerate().find_map(|(index, lower)| {
+            lower
+                .lstat_resolved_path(path)
+                .ok()
+                .map(|stat| (index, stat))
+        })
+    }
+
+    fn merged_lstat_resolved(&self, path: &str) -> VfsResult<VirtualStat> {
+        if Self::is_internal_metadata_path(path) || self.is_whited_out(path) {
+            return Err(Self::entry_not_found(path));
+        }
+        if let Some(upper) = self.upper.as_ref() {
+            if let Ok(stat) = upper.lstat_resolved_path(path) {
+                return Ok(stat);
+            }
+        }
+        self.find_lower_by_resolved_entry(path)
+            .map(|(_, stat)| stat)
+            .ok_or_else(|| Self::entry_not_found(path))
+    }
+
     fn merged_lstat(&self, path: &str) -> VfsResult<VirtualStat> {
         if Self::is_internal_metadata_path(path) {
             return Err(Self::entry_not_found(path));
@@ -860,6 +947,51 @@ impl OverlayFileSystem {
         self.lowers[index].read_link(path)
     }
 
+    fn read_link_resolved_inner(&self, path: &str) -> VfsResult<String> {
+        if Self::is_internal_metadata_path(path) || self.is_whited_out(path) {
+            return Err(Self::entry_not_found(path));
+        }
+        if let Some(upper) = self.upper.as_ref() {
+            if upper.lstat_resolved_path(path).is_ok() {
+                return upper.read_link_resolved_path(path);
+            }
+        }
+        let Some((index, _)) = self.find_lower_by_resolved_entry(path) else {
+            return Err(Self::entry_not_found(path));
+        };
+        self.lowers[index].read_link_resolved_path(path)
+    }
+
+    fn resolve_guarded_path(&self, path: &str) -> VfsResult<String> {
+        if Self::is_internal_metadata_path(path) {
+            return Err(Self::entry_not_found(path));
+        }
+        let resolved = self.resolve_merged_path(path, true, 0)?;
+        if Self::is_internal_metadata_path(&resolved) {
+            return Err(Self::entry_not_found(path));
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_guarded_entry_path(&self, path: &str) -> VfsResult<(String, VirtualStat)> {
+        if Self::is_internal_metadata_path(path) {
+            return Err(Self::entry_not_found(path));
+        }
+        let resolved = self.resolve_merged_path(path, false, 0)?;
+        if Self::is_internal_metadata_path(&resolved) {
+            return Err(Self::entry_not_found(path));
+        }
+        let stat = self.merged_lstat_resolved(&resolved)?;
+        if stat.is_symbolic_link {
+            if let Ok(target) = self.resolve_merged_path(path, true, 0) {
+                if Self::is_internal_metadata_path(&target) {
+                    return Err(Self::entry_not_found(path));
+                }
+            }
+        }
+        Ok((resolved, stat))
+    }
+
     fn ensure_ancestor_directories_in_upper(&mut self, path: &str) -> VfsResult<()> {
         if Self::is_internal_metadata_path(path) {
             return Err(VfsError::permission_denied("mkdir", path));
@@ -896,6 +1028,44 @@ impl OverlayFileSystem {
             upper.mkdir(&current, false)?;
         }
 
+        Ok(())
+    }
+
+    fn ensure_resolved_ancestor_directories_in_upper(&mut self, path: &str) -> VfsResult<()> {
+        let parts = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        let mut current = String::new();
+        for part in parts.iter().take(parts.len().saturating_sub(1)) {
+            current.push('/');
+            current.push_str(part);
+
+            if let Some(upper) = self.upper.as_ref() {
+                if let Ok(stat) = upper.lstat_resolved_path(&current) {
+                    if !stat.is_directory || stat.is_symbolic_link {
+                        return Err(Self::not_directory(&current));
+                    }
+                    continue;
+                }
+            }
+
+            if let Some((_, stat)) = self.find_lower_by_resolved_entry(&current) {
+                if !stat.is_directory || stat.is_symbolic_link {
+                    return Err(Self::not_directory(&current));
+                }
+                let uid = stat.uid;
+                let gid = stat.gid;
+                let mode = stat.mode;
+                let upper = self.writable_upper(&current)?;
+                upper.create_dir_resolved_path(&current, Some(mode))?;
+                upper.chown(&current, uid, gid)?;
+                continue;
+            }
+
+            self.writable_upper(&current)?
+                .create_dir_resolved_path(&current, None)?;
+        }
         Ok(())
     }
 
@@ -1491,16 +1661,30 @@ impl VirtualFileSystem for OverlayFileSystem {
     }
 
     fn write_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
-        if self.touches_internal_metadata(path) {
+        self.write_file_with_mode(path, content, None)
+    }
+
+    fn write_file_with_mode(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<()> {
+        if Self::is_internal_metadata_path(path) {
             return Err(VfsError::permission_denied("open", path));
         }
-        self.clear_path_metadata(path)?;
-        if self.find_lower_by_entry(path).is_some() {
-            self.copy_up_path(path)?;
-        } else {
-            self.ensure_ancestor_directories_in_upper(path)?;
+        let resolved = self.resolve_merged_path(path, true, 0)?;
+        if Self::is_internal_metadata_path(&resolved) {
+            return Err(VfsError::permission_denied("open", path));
         }
-        self.writable_upper(path)?.write_file(path, content.into())
+        self.clear_path_metadata(&resolved)?;
+        if self.find_lower_by_resolved_entry(&resolved).is_some() {
+            self.copy_up_path(&resolved)?;
+        } else {
+            self.ensure_resolved_ancestor_directories_in_upper(&resolved)?;
+        }
+        self.writable_upper(&resolved)?
+            .write_file_resolved_path(&resolved, content.into(), mode)
     }
 
     fn create_file_exclusive(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
@@ -1514,6 +1698,30 @@ impl VirtualFileSystem for OverlayFileSystem {
         self.ensure_ancestor_directories_in_upper(path)?;
         self.writable_upper(path)?
             .create_file_exclusive(path, content.into())
+    }
+
+    fn create_file_exclusive_with_mode_stat(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        mode: Option<u32>,
+    ) -> VfsResult<VirtualStat> {
+        if Self::is_internal_metadata_path(path) {
+            return Err(VfsError::permission_denied("open", path));
+        }
+        let resolved = self.resolved_destination_path(path)?;
+        if Self::is_internal_metadata_path(&resolved) {
+            return Err(VfsError::permission_denied("open", path));
+        }
+        self.clear_path_metadata(&resolved)?;
+        match self.merged_lstat_resolved(&resolved) {
+            Ok(_) => return Err(Self::already_exists(path)),
+            Err(error) if error.code() == "ENOENT" => {}
+            Err(error) => return Err(error),
+        }
+        self.ensure_resolved_ancestor_directories_in_upper(&resolved)?;
+        self.writable_upper(&resolved)?
+            .create_file_exclusive_resolved_path(&resolved, content.into(), mode)
     }
 
     fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
@@ -1570,30 +1778,13 @@ impl VirtualFileSystem for OverlayFileSystem {
     }
 
     fn exists(&self, path: &str) -> bool {
-        if self.touches_internal_metadata(path) {
-            return false;
-        }
-        self.path_exists_in_merged_view(path)
+        self.resolve_guarded_path(path)
+            .is_ok_and(|resolved| self.merged_lstat_resolved(&resolved).is_ok())
     }
 
     fn stat(&mut self, path: &str) -> VfsResult<VirtualStat> {
-        if self.touches_internal_metadata(path) {
-            return Err(Self::entry_not_found(path));
-        }
-        if self.is_whited_out(path) {
-            return Err(Self::entry_not_found(path));
-        }
-        if self.exists_in_upper(path) {
-            return self
-                .upper
-                .as_mut()
-                .expect("upper must exist when path exists")
-                .stat(path);
-        }
-        let Some(index) = self.find_lower_by_exists(path) else {
-            return Err(Self::entry_not_found(path));
-        };
-        self.lowers[index].stat(path)
+        let resolved = self.resolve_guarded_path(path)?;
+        self.merged_lstat_resolved(&resolved)
     }
 
     fn remove_file(&mut self, path: &str) -> VfsResult<()> {
@@ -1735,23 +1926,9 @@ impl VirtualFileSystem for OverlayFileSystem {
     }
 
     fn realpath(&self, path: &str) -> VfsResult<String> {
-        if self.touches_internal_metadata(path) {
-            return Err(Self::entry_not_found(path));
-        }
-        if self.is_whited_out(path) {
-            return Err(Self::entry_not_found(path));
-        }
-        if self.exists_in_upper(path) {
-            return self
-                .upper
-                .as_ref()
-                .expect("upper must exist when path exists")
-                .realpath(path);
-        }
-        let Some(index) = self.find_lower_by_exists(path) else {
-            return Err(Self::entry_not_found(path));
-        };
-        self.lowers[index].realpath(path)
+        let resolved = self.resolve_guarded_path(path)?;
+        self.merged_lstat_resolved(&resolved)?;
+        Ok(resolved)
     }
 
     fn symlink(&mut self, target: &str, link_path: &str) -> VfsResult<()> {
@@ -1764,42 +1941,28 @@ impl VirtualFileSystem for OverlayFileSystem {
     }
 
     fn read_link(&self, path: &str) -> VfsResult<String> {
-        if self.touches_internal_metadata(path) {
-            return Err(Self::entry_not_found(path));
+        let (resolved, stat) = self.resolve_guarded_entry_path(path)?;
+        if !stat.is_symbolic_link {
+            return Err(VfsError::new(
+                "EINVAL",
+                format!("invalid argument, readlink '{path}'"),
+            ));
         }
-        if self.is_whited_out(path) {
-            return Err(Self::entry_not_found(path));
-        }
-        if self.has_entry_in_upper(path) {
-            return self
-                .upper
-                .as_ref()
-                .expect("upper must exist when path exists")
-                .read_link(path);
-        }
-        let Some((index, _)) = self.find_lower_by_entry(path) else {
-            return Err(Self::entry_not_found(path));
-        };
-        self.lowers[index].read_link(path)
+        self.read_link_resolved_inner(&resolved)
     }
 
     fn lstat(&self, path: &str) -> VfsResult<VirtualStat> {
-        if self.touches_internal_metadata(path) {
-            return Err(Self::entry_not_found(path));
+        self.resolve_guarded_entry_path(path).map(|(_, stat)| stat)
+    }
+
+    fn lstat_exact(&self, path: &str) -> Option<VirtualStat> {
+        let normalized = Self::normalized(path);
+        if Self::is_internal_metadata_path(&normalized) || self.is_whited_out(&normalized) {
+            return None;
         }
-        if self.is_whited_out(path) {
-            return Err(Self::entry_not_found(path));
-        }
-        if self.has_entry_in_upper(path) {
-            return self
-                .upper
-                .as_ref()
-                .expect("upper must exist when path exists")
-                .lstat(path);
-        }
-        self.find_lower_by_entry(path)
-            .map(|(_, stat)| stat)
-            .ok_or_else(|| Self::entry_not_found(path))
+        self.upper
+            .as_ref()
+            .and_then(|upper| upper.lstat_resolved_path(&normalized).ok())
     }
 
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
@@ -2223,6 +2386,38 @@ mod tests {
             restored.read_dir("/data").expect("read merged directory"),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn upper_parent_fast_path_preserves_lower_symlink_and_missing_leaf_semantics() {
+        let mut lower = MemoryFileSystem::new();
+        lower.mkdir("/pkg", true).unwrap();
+        lower
+            .write_file("/pkg/target.txt", b"lower".to_vec())
+            .unwrap();
+        lower.symlink("target.txt", "/pkg/link.txt").unwrap();
+
+        let mut upper = MemoryFileSystem::new();
+        upper.mkdir("/pkg", true).unwrap();
+        let mut overlay = OverlayFileSystem::with_upper(vec![lower], upper);
+
+        assert_eq!(overlay.read_file("/pkg/target.txt").unwrap(), b"lower");
+        assert!(overlay.lstat("/pkg/link.txt").unwrap().is_symbolic_link);
+        assert_eq!(
+            overlay.stat("/pkg/link.txt").unwrap().size,
+            b"lower".len() as u64
+        );
+        assert_error_code(overlay.lstat("/pkg/missing.txt"), "ENOENT");
+
+        let created = overlay
+            .create_file_exclusive_with_mode_stat(
+                "/pkg/missing.txt",
+                b"upper".to_vec(),
+                Some(0o640),
+            )
+            .expect("a proven missing leaf under the upper parent remains creatable");
+        assert_eq!(created.size, b"upper".len() as u64);
+        assert_eq!(overlay.read_file("/pkg/missing.txt").unwrap(), b"upper");
     }
 
     #[test]
