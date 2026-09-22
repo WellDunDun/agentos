@@ -1,0 +1,39 @@
+name: Nested process candidate
+on:
+  push:
+    branches: [codex/heyagents-runtime-build]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      AGENTOS_SKIP_NATIVE_META_BUILD: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile --filter '@rivet-dev/agentos-build-tools'
+      - name: Configure upstream Linux build toolchain
+        run: bash scripts/ci/setup-linux-gnu-sysroot.sh
+      - name: Build pinned sidecar with candidate fix
+        run: cargo build --locked -p agentos-sidecar -j 2
+      - name: Test WASM child control dispatch and output ownership
+        run: cargo test --locked -p agentos-native-sidecar --test service wasm_parent_ -j 2
+      - name: Record binary checksum
+        run: sha256sum target/debug/agentos-sidecar > target/debug/agentos-sidecar.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentos-sidecar-linux-x64-candidate
+          path: |
+            target/debug/agentos-sidecar
+            target/debug/agentos-sidecar.sha256
+          retention-days: 7
+          if-no-files-found: error
