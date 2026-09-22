@@ -2756,8 +2756,9 @@ where
 
                 // The standalone WASM runner pulls descendant output through
                 // child_process.poll while implementing waitpid. Keep stream
-                // and exit delivery single-owner; the parked kernel wait was
-                // already rechecked above without leasing either event lane.
+                // and exit delivery single-owner, but still claim control RPCs:
+                // the parent's poll requeues nested spawn/exec requests for this
+                // pump, so skipping the child entirely would starve them.
                 let parent_is_pull_driven_wasm = self
                     .vms
                     .get(vm_id)
@@ -2769,7 +2770,26 @@ where
                     })
                     .unwrap_or(false);
                 if parent_is_pull_driven_wasm {
-                    continue;
+                    let queued_control_request = self.vms.get(vm_id).is_some_and(|vm| {
+                        vm.active_processes
+                            .get(process_id)
+                            .and_then(|root| Self::active_process_by_path(root, &parent_path))
+                            .and_then(|parent| parent.child_processes.get(&child_process_id))
+                            .and_then(|child| child.pending_execution_events.front())
+                            .is_some_and(|event| {
+                                matches!(event,
+                                ActiveExecutionEvent::JavascriptSyncRpcRequest(request)
+                                if matches!(request.method.as_str(),
+                                    "child_process.spawn" | "child_process.spawn_sync"
+                                    | "child_process.poll" | "child_process.write_stdin"
+                                    | "child_process.close_stdin" | "child_process.kill"
+                                    | "process.exec_fd_image_commit" | "process.exec"
+                                    | "process.signal_state" | "process.kill"))
+                            })
+                    });
+                    if !queued_control_request {
+                        continue;
+                    }
                 }
                 self.expire_child_process_sync_if_needed(
                     vm_id,
@@ -2783,7 +2803,7 @@ where
                     process_id,
                     &parent_path,
                     &child_process_id,
-                    false,
+                    parent_is_pull_driven_wasm,
                     javascript_services,
                     python_services,
                     python_socket_completions,
