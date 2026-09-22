@@ -26,14 +26,19 @@ jobs:
       - name: Build pinned sidecar with candidate fix
         run: cargo build --locked -p agentos-sidecar -j 2
       - name: Test WASM child control dispatch and output ownership
-        run: cargo test --locked -p agentos-native-sidecar --test service wasm_parent_ -j 2
-      - name: Record binary checksum
-        run: sha256sum target/debug/agentos-sidecar > target/debug/agentos-sidecar.sha256
+        run: cargo test --locked -p agentos-native-sidecar --test service wasm_parent_ -j 2 -- --test-threads=1
+      - name: Strip candidate and record provenance
+        run: |
+          strip target/debug/agentos-sidecar
+          cd target/debug
+          sha256sum agentos-sidecar > agentos-sidecar.sha256
+          git rev-parse HEAD > source-commit.txt
       - uses: actions/upload-artifact@v4
         with:
           name: agentos-sidecar-linux-x64-candidate
           path: |
             target/debug/agentos-sidecar
             target/debug/agentos-sidecar.sha256
+            target/debug/source-commit.txt
           retention-days: 7
           if-no-files-found: error
