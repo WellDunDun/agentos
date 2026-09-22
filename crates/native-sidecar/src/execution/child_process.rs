@@ -5,6 +5,22 @@ const SYNTHETIC_V8_TERMINATION_STDERR: &[u8] = b"Error: Execution terminated\n";
 type OwnedChildExecutionStart =
     Pin<Box<dyn Future<Output = Result<ActiveExecution, SidecarError>> + 'static>>;
 
+fn is_owned_process_control_rpc(method: &str) -> bool {
+    matches!(
+        method,
+        "child_process.spawn"
+            | "child_process.spawn_sync"
+            | "child_process.poll"
+            | "child_process.write_stdin"
+            | "child_process.close_stdin"
+            | "child_process.kill"
+            | "process.exec_fd_image_commit"
+            | "process.exec"
+            | "process.signal_state"
+            | "process.kill"
+    )
+}
+
 fn settle_owned_javascript_process_event_target<B>(
     target: OwnedJavascriptEventService,
     response: Result<JavascriptSyncRpcServiceResponse, SidecarError>,
@@ -2779,12 +2795,7 @@ where
                             .is_some_and(|event| {
                                 matches!(event,
                                 ActiveExecutionEvent::JavascriptSyncRpcRequest(request)
-                                if matches!(request.method.as_str(),
-                                    "child_process.spawn" | "child_process.spawn_sync"
-                                    | "child_process.poll" | "child_process.write_stdin"
-                                    | "child_process.close_stdin" | "child_process.kill"
-                                    | "process.exec_fd_image_commit" | "process.exec"
-                                    | "process.signal_state" | "process.kill"))
+                                if is_owned_process_control_rpc(&request.method))
                             })
                     });
                     if !queued_control_request {
@@ -7028,18 +7039,7 @@ where
             _ => {}
         }
 
-        let special = matches!(
-            target.request.method.as_str(),
-            "child_process.poll"
-                | "child_process.write_stdin"
-                | "child_process.close_stdin"
-                | "child_process.kill"
-                | "process.exec_fd_image_commit"
-                | "process.exec"
-                | "process.signal_state"
-                | "process.kill"
-        );
-        if !special {
+        if !is_owned_process_control_rpc(&target.request.method) {
             return Box::pin(async move {
                 let result = service_owned_javascript_sync_rpc_request(
                     &bridge,
@@ -7385,19 +7385,7 @@ where
                         drop(reservation);
                         continue;
                     }
-                    if matches!(
-                        request.method.as_str(),
-                        "child_process.spawn"
-                            | "child_process.spawn_sync"
-                            | "child_process.poll"
-                            | "child_process.write_stdin"
-                            | "child_process.close_stdin"
-                            | "child_process.kill"
-                            | "process.exec_fd_image_commit"
-                            | "process.exec"
-                            | "process.signal_state"
-                            | "process.kill"
-                    ) {
+                    if is_owned_process_control_rpc(&request.method) {
                         vm.try_command("requeue nested special process RPC", |state| {
                             let path = current_process_path
                                 .iter()
