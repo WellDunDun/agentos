@@ -675,7 +675,7 @@ impl RawBodyReader {
                             .map_err(|e| {
                                 HttpError::Protocol(format!("invalid chunk size: {}", e))
                             })?;
-                        self.buf.drain(..pos + 2); // skip size line + CRLF
+                        let body_start = pos + 2; // Keep framing until the complete chunk arrives.
                         if chunk_size == 0 {
                             self.done = true;
                             return Ok(ChunkPoll::Eof);
@@ -683,7 +683,7 @@ impl RawBodyReader {
                         if chunk_size > MAX_RESPONSE_BODY_BYTES {
                             return Err(HttpError::Protocol("response body too large".into()));
                         }
-                        while self.buf.len() < chunk_size + 2 {
+                        while self.buf.len() < body_start + chunk_size + 2 {
                             match recv_cooperative_http(self.fd, &mut recv_buf)? {
                                 ChunkPoll::Ready(n) => {
                                     self.buf.extend_from_slice(&recv_buf[..n as usize]);
@@ -696,11 +696,11 @@ impl RawBodyReader {
                                 ChunkPoll::WouldBlock => return Ok(ChunkPoll::WouldBlock),
                             }
                         }
-                        if &self.buf[chunk_size..chunk_size + 2] != b"\r\n" {
+                        if &self.buf[body_start + chunk_size..body_start + chunk_size + 2] != b"\r\n" {
                             return Err(HttpError::Protocol("missing chunk terminator".into()));
                         }
-                        let out: Vec<u8> = self.buf[..chunk_size].to_vec();
-                        self.buf.drain(..chunk_size + 2); // skip chunk + CRLF
+                        let out: Vec<u8> = self.buf[body_start..body_start + chunk_size].to_vec();
+                        self.buf.drain(..body_start + chunk_size + 2); // Skip header, body and CRLF.
                         return Ok(ChunkPoll::Ready(out));
                     }
                     match recv_cooperative_http(self.fd, &mut recv_buf)? {

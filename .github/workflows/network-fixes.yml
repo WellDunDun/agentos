@@ -1,0 +1,76 @@
+name: HeyAgents transport and teardown fixes
+on:
+  push:
+    branches: [codex/heyagents-network-fixes-20261012]
+permissions:
+  contents: read
+jobs:
+  sidecar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      LINUX_GNU_LLVM_VERSION: '23'
+      AGENTOS_SKIP_NATIVE_META_BUILD: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile --filter '@rivet-dev/agentos-build-tools'
+      - run: bash scripts/ci/setup-linux-gnu-sysroot.sh
+      - run: cargo test --locked -p agentos-execution process_timer_worker_does_not_hold_vm_scope_open -j 2 -- --test-threads=1
+      - run: cargo build --release --locked -p agentos-sidecar -j 2
+      - run: cargo test --locked -p agentos-native-sidecar --test service wasm_parent_ -j 2 -- --test-threads=1
+      - run: |
+          strip target/release/agentos-sidecar
+          sha256sum target/release/agentos-sidecar > target/release/agentos-sidecar.sha256
+          git rev-parse HEAD > target/release/source-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heyagents-network-fixed-sidecar
+          path: |
+            target/release/agentos-sidecar
+            target/release/agentos-sidecar.sha256
+            target/release/source-commit.txt
+          retention-days: 7
+          if-no-files-found: error
+  codex:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-01
+          components: rust-src
+          targets: wasm32-wasip1
+      - name: Check streamed-body regression against real library
+        run: |
+          cp toolchain/crates/libs/wasi-http/src/lib.rs /tmp/chunk-test-library.rs
+          cp scripts/chunk-test-harness.rs /tmp/chunk-test-harness.rs
+          rustc --edition=2024 --test /tmp/chunk-test-harness.rs -o /tmp/chunk-tests
+          /tmp/chunk-tests
+      - run: sudo apt-get update && sudo apt-get install --yes cmake binaryen
+      - run: make -C toolchain/c wasi-sdk
+      - run: make -C toolchain c/sysroot/lib/wasm32-wasi/libc.a
+      - name: Rebuild real pinned Codex WASM with repaired HTTP reader
+        run: DEST_DIR="$PWD/artifacts/codex-cli/bin" toolchain/scripts/clone-and-build-codex-wasi.sh
+      - run: |
+          sha256sum artifacts/codex-cli/bin/codex-exec > artifacts/codex-cli.sha256
+          git rev-parse HEAD > artifacts/source-commit.txt
+          cat toolchain/codex-ref > artifacts/codex-source.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heyagents-network-fixed-codex
+          path: artifacts
+          retention-days: 7
+          if-no-files-found: error
