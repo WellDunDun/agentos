@@ -12,6 +12,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
+      LINUX_GNU_LLVM_VERSION: '23'
       AGENTOS_SKIP_NATIVE_META_BUILD: '1'
     steps:
       - uses: actions/checkout@v4
