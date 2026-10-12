@@ -1,7 +1,7 @@
-name: Nested process candidate
+name: HeyAgents matched release control
 on:
   push:
-    branches: [codex/heyagents-runtime-build]
+    branches: [codex/heyagents-runtime-release-20261012]
 permissions:
   contents: read
 jobs:
@@ -24,21 +24,21 @@ jobs:
       - name: Configure upstream Linux build toolchain
         run: bash scripts/ci/setup-linux-gnu-sysroot.sh
       - name: Build pinned sidecar with candidate fix
-        run: cargo build --locked -p agentos-sidecar -j 2
+        run: cargo build --release --locked -p agentos-sidecar -j 2
       - name: Test WASM child control dispatch and output ownership
         run: cargo test --locked -p agentos-native-sidecar --test service wasm_parent_ -j 2 -- --test-threads=1
       - name: Strip candidate and record provenance
         run: |
-          strip target/debug/agentos-sidecar
-          cd target/debug
+          strip target/release/agentos-sidecar
+          cd target/release
           sha256sum agentos-sidecar > agentos-sidecar.sha256
           git rev-parse HEAD > source-commit.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: agentos-sidecar-linux-x64-candidate
+          name: agentos-sidecar-linux-x64-release-control
           path: |
-            target/debug/agentos-sidecar
-            target/debug/agentos-sidecar.sha256
-            target/debug/source-commit.txt
+            target/release/agentos-sidecar
+            target/release/agentos-sidecar.sha256
+            target/release/source-commit.txt
           retention-days: 7
           if-no-files-found: error
