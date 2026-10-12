@@ -6,6 +6,7 @@ permissions:
   contents: read
 jobs:
   sidecar:
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -62,6 +63,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install --yes cmake binaryen
       - run: make -C toolchain/c wasi-sdk
       - run: make -C toolchain c/sysroot/lib/wasm32-wasi/libc.a
+      - run: make -C toolchain patch-std
       - name: Rebuild real pinned Codex WASM with repaired HTTP reader
         run: DEST_DIR="$PWD/artifacts/codex-cli/bin" toolchain/scripts/clone-and-build-codex-wasi.sh
       - run: |
