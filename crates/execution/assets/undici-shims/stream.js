@@ -101,6 +101,8 @@ export const finished = (stream, options, callback) => {
 			return;
 		}
 		timer = setTimeout(poll, 0);
+		// Completion observers do not own the lifetime of the response body.
+		timer.unref();
 	};
 
 	poll();

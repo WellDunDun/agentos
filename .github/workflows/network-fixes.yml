@@ -6,7 +6,6 @@ permissions:
   contents: read
 jobs:
   sidecar:
-    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -42,6 +41,7 @@ jobs:
           retention-days: 7
           if-no-files-found: error
   codex:
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
